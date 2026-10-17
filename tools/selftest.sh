@@ -21,6 +21,7 @@ UPLOADPROBE="$DIR/build/uploadprobe"
 BIGBUFPROBE="$DIR/build/bigbufprobe"
 WRITECONTRACT="$DIR/build/writecontract"
 READCONTRACT="$DIR/build/readcontract"
+STATECONTRACT="$DIR/build/statecontract"
 LATECHECK="$DIR/build/latecheck"
 POOLPROBE="$DIR/build/poolprobe"
 pass=0; fail=0
@@ -66,6 +67,8 @@ fi
     -framework CoreFoundation -framework Security -o "$WRITECONTRACT" "$DIR/tools/writecontract.c"
 [ -x "$READCONTRACT" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
     -framework CoreFoundation -framework Security -o "$READCONTRACT" "$DIR/tools/readcontract.c"
+[ -x "$STATECONTRACT" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
+    -framework CoreFoundation -framework Security -o "$STATECONTRACT" "$DIR/tools/statecontract.c"
 
 # Rules used only by the rewrite tests. example.invalid deliberately does not resolve:
 # if the redirect works, DNS is never consulted for it.
@@ -287,6 +290,15 @@ cr_eng=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$READCONTRACT" postm
 check "short-read contract matches stock" "^identical$" \
   "$([ -n "$cr_stock" ] && [ "$cr_stock" = "$cr_eng" ] && echo identical || echo differs)"
 [ "$cr_stock" = "$cr_eng" ] || diff <(echo "$cr_stock") <(echo "$cr_eng") | sed 's/^/        /'
+
+# The same for SSLGetSessionState, through a handshake that pauses for server authentication.
+# native-tls needs kSSLHandshake at that pause, or it will not fetch the peer trust. Nothing in
+# the output depends on the network, so it is compared whole.
+cs_stock=$("$STATECONTRACT" postman-echo.com 2>&1 | grep -E '^  ')
+cs_eng=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$STATECONTRACT" postman-echo.com 2>&1 | grep -E '^  ')
+check "session-state contract matches stock" "^identical$" \
+  "$([ -n "$cs_stock" ] && [ "$cs_stock" = "$cs_eng" ] && echo identical || echo differs)"
+[ "$cs_stock" = "$cs_eng" ] || diff <(echo "$cs_stock") <(echo "$cs_eng") | sed 's/^/        /'
 
 echo "== client certificates =="
 # Whether the certificate the client was given actually reaches the server. A client that

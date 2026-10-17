@@ -607,6 +607,29 @@ An end of stream or an error reached *after* some bytes is not allowed to swallo
 data is handed over with `noErr` and the condition surfaces on the next call, once there is
 nothing left to deliver first.
 
+### Session state
+
+| point in the handshake | `SSLGetSessionState` |
+|---|---|
+| before the first `SSLHandshake` | `kSSLIdle` |
+| handshake in flight (`errSSLWouldBlock`) | `kSSLHandshake` |
+| paused for server authentication (`errSSLPeerAuthCompleted`) | **`kSSLHandshake`** |
+| connected | `kSSLConnected` |
+| after `SSLClose` | `kSSLClosed` |
+
+The row that matters is the pause. Rust's security-framework, which native-tls uses, asks for
+the state there before it fetches the peer trust. On `kSSLIdle` it returns `errSecBadReq` (-909)
+itself, so every native-tls client needs `kSSLHandshake` at that point.
+
+The native context cannot give that answer. The engine's handshake never reaches it, so it says
+`kSSLIdle` until the connection is up. The hook answers `kSSLHandshake` itself instead, while
+the engine is handshaking.
+
+CFNetwork asks only before the first `SSLHandshake`, where the native answer is already right.
+
+`tools/statecontract.c` measures these answers on the stock stack, and `selftest.sh` requires the
+engine's to match them exactly.
+
 ### The one thing that does not match, and why it cannot
 
 Every status and every `*processed` above matches the stock stack. What does not is how many
@@ -1002,6 +1025,8 @@ tools/readcontract.c    # starving an IO callback of its own; run against the st
                         # print the reference answers, and against the engine they must match.
                         # Nothing else here reaches those states: a request small enough to fit
                         # in the socket send buffer never blocks
+tools/statecontract.c   # what SSLGetSessionState says at each step of a handshake that pauses
+                        # for server authentication; compared with the stock stack the same way
 tools/uploadprobe.c     # a POST big enough to fill that buffer, in-memory body or streamed from
                         # a file, blocking reads or run-loop scheduled -- CFNetwork drives writes
                         # differently in each, and reports peak RSS so a write path that grew
