@@ -14,6 +14,7 @@
 #define ST_ClosedAbort    -9806
 #define ST_PeerAuth       -9841
 #define ST_Internal       -9838
+#define ST_Handshake       1
 #define ST_Connected       2
 #define ST_TLS12           8
 
