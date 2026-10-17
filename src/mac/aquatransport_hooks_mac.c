@@ -437,11 +437,19 @@ static OSStatus my_SSLDisposeContext(SSLContextRef c) {
     return o_SSLDisposeContext(c);
 }
 
+// Answer kSSLHandshake while the engine is handshaking, as the stock stack does from the first
+// SSLHandshake until it connects. The native context cannot: the engine's handshake never reaches
+// it, so it says kSSLIdle until the connection is up.
+//
+// The pause for server authentication is where it matters. Rust's security-framework, under
+// native-tls, asks for the state there, and on kSSLIdle returns errSecBadReq instead of fetching
+// the peer trust. tools/statecontract.c measures the stock answers.
 static OSStatus my_SSLGetSessionState(SSLContextRef c, SSLSessionState *st) {
     if (!tf_on()) return o_SSLGetSessionState(c, st);
     Shadow *s = sh_get(c);
     OSStatus rv;
     if (s && s->state == 2) { if (st) *st = ST_Connected; rv = noErr; }
+    else if (s && (s->state == 1 || s->state == 3)) { if (st) *st = ST_Handshake; rv = noErr; }
     else rv = o_SSLGetSessionState(c, st);
     sh_release(s);
     return rv;
