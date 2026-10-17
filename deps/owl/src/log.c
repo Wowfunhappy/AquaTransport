@@ -25,6 +25,9 @@
 #include <stdarg.h>
 #include <string.h>
 #include <time.h>
+#ifdef __APPLE__
+#include <syslog.h>
+#endif
 
 #include "log.h"
 
@@ -95,6 +98,17 @@ int log_log(int level, const char *file, int line, const char *fmt, ...) {
 
 	/* Acquire lock */
 	lock();
+
+#ifdef __APPLE__
+	/* The socket helper sends child stderr to /dev/null. Keep actionable
+	 * failures (including capture startup failures after wake) in system.log. */
+	if (level <= LOG_ERR) {
+		va_list args;
+		va_start(args, fmt);
+		vsyslog(level, fmt, args);
+		va_end(args);
+	}
+#endif
 
 	/* Get current time */
 	time_t t = time(NULL);

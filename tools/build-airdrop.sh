@@ -32,7 +32,7 @@ clang "${FLAGS[@]}" -dynamiclib "$SOURCES/AQAirDrop.m" "$SOURCES/AQUI.m" "$DIR/d
   -framework Foundation -framework CFNetwork -framework AppKit -framework IOBluetooth -framework CoreWLAN -Wl,-exported_symbols_list,"$BUILD/exports.txt" \
   -install_name /usr/share/aquatransport/aquatransport_airdrop.dylib -o "$ST/aquatransport_airdrop.dylib"
 clang "${FLAGS[@]}" "$SOURCES/AQHelper.m" "$SOURCES/AQWiFiLease.m" \
-  -framework Foundation -framework CoreWLAN -framework IOBluetooth -framework SystemConfiguration -o "$ST/airdrop/org.aquatransport.airdrop"
+  -framework Foundation -framework CoreWLAN -framework IOBluetooth -framework SystemConfiguration -framework IOKit -o "$ST/airdrop/org.aquatransport.airdrop"
 bootstrap_slices=()
 for arch in x86_64 i386; do
   bootstrap="$BUILD/aquatransport-bootstrap-$arch"

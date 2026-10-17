@@ -29,22 +29,22 @@ int main(int argc, char **argv)
     @autoreleasepool {
         IOBluetoothHostController *controller = [IOBluetoothHostController defaultController];
         if (![controller respondsToSelector:@selector(BluetoothHCILESetAdvertiseEnable:)] || ![controller respondsToSelector:@selector(BluetoothHCILESetAdvertisingData:advertsingData:)] || ![controller respondsToSelector:@selector(BluetoothHCILESetAdvertisingParameters:advertisingIntervalMax:advertisingType:ownAddressType:directAddressType:directAddress:advertisingChannelMap:advertisingFilterPolicy:)]) {
-            fprintf(stderr, "Mavericks LE advertising API unavailable\n"); return 1;
+            NSLog(@"AquaTransport AirDrop: Mavericks LE advertising API unavailable"); return 1;
         }
         BluetoothDeviceAddress direct = {{0}};
         // Nonconnectable advertisement every 100 ms, on all three LE channels.
         int status = [controller BluetoothHCILESetAdvertisingParameters:160 advertisingIntervalMax:160
             advertisingType:3 ownAddressType:0 directAddressType:0 directAddress:&direct
             advertisingChannelMap:7 advertisingFilterPolicy:0];
-        if (status) { fprintf(stderr, "advertising parameters failed: %#x\n", status); return 1; }
+        if (status) { NSLog(@"AquaTransport AirDrop: Bluetooth advertising parameters failed: %#x", status); return 1; }
         // Anonymous AirDrop discovery announcement; no contact identifiers.
         char data[31] = {2, 1, 6, 0x17, (char)0xff, 0x4c, 0, 5, 0x12,
                         0,0,0,0,0,0,0,0, 1, 0,0,0,0,0,0,0,0, 0};
         status = [controller BluetoothHCILESetAdvertisingData:27 advertsingData:data];
-        if (status) { fprintf(stderr, "advertising data failed: %#x\n", status); return 1; }
+        if (status) { NSLog(@"AquaTransport AirDrop: Bluetooth advertising data failed: %#x", status); return 1; }
         signal(SIGINT, stop); signal(SIGTERM, stop); signal(SIGALRM, stop);
         status = [controller BluetoothHCILESetAdvertiseEnable:1];
-        if (status) { fprintf(stderr, "advertising enable failed: %#x\n", status); return 1; }
+        if (status) { NSLog(@"AquaTransport AirDrop: Bluetooth advertising enable failed: %#x", status); return 1; }
         printf("AirDrop sender announcement enabled for %ld seconds\n", duration); fflush(stdout);
         alarm((unsigned int)duration);
         while (!stopped) pause();

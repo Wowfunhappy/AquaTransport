@@ -307,7 +307,9 @@ static int io_state_init_wlan(struct io_state *state, const char *wlan, const st
 	state->wlan_fd = open_nonblocking_device(state->wlan_ifname, &state->wlan_handle, bssid_filter);
 	if (state->wlan_fd < 0) {
 		log_error("Could not open device: %s", state->wlan_ifname);
-		return err;
+		/* link_up succeeded, so err is zero here. Propagate the capture
+		 * failure instead of starting TAP/AWDL with an invalid handle. */
+		return state->wlan_fd;
 	}
 	err = link_ether_addr_get(state->wlan_ifname, &state->if_ether_addr);
 	if (err < 0) {

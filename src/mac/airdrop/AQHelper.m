@@ -58,9 +58,17 @@ static pid_t launch(NSString *name,NSArray *arguments) {
     posix_spawnattr_destroy(&attributes); posix_spawn_file_actions_destroy(&actions);
     for(NSUInteger i=0;i<args.count;i++) free(argv[i]); free(argv); AQRequire(!error && pid>0,@"Could not start the radio process."); return pid;
 }
-static void reap(pid_t *pid) { if(*pid>0 && waitpid(*pid,NULL,WNOHANG)==*pid) *pid=0; }
+static void reap(pid_t *pid,NSString *name) {
+    int status;
+    if(*pid>0 && waitpid(*pid,&status,WNOHANG)==*pid) {
+        if(WIFSIGNALED(status)) NSLog(@"AquaTransport AirDrop: %@ exited on signal %d",name,WTERMSIG(status));
+        else if(WIFEXITED(status) && WEXITSTATUS(status)) NSLog(@"AquaTransport AirDrop: %@ exited with status %d",name,WEXITSTATUS(status));
+        *pid=0;
+    }
+}
 static void terminate(pid_t *pid) { if(*pid>0) { kill(*pid,SIGTERM); for(int i=0;i<30;i++) { if(waitpid(*pid,NULL,WNOHANG)==*pid) { *pid=0; return; } usleep(100000); } kill(*pid,SIGKILL); waitpid(*pid,NULL,0); *pid=0; } }
 static void radioStop(void) { terminate(&blePID); terminate(&owlPID); [wifiLease restore]; wifiLease=nil; radioWiFi=nil; owner=(uid_t)-1; }
+#include "AQHelperPower.inc"
 int main(void) { @autoreleasepool {
     if(geteuid()!=0) return 1; umask(077); signal(SIGTERM,stopSignal); signal(SIGINT,stopSignal); signal(SIGPIPE,SIG_IGN);
     struct utsname os;
@@ -75,12 +83,21 @@ int main(void) { @autoreleasepool {
     int listener=inherited>=0 ? dup(inherited) : -1;
     launch_data_free(response); if(listener<0) return 5;
     fcntl(listener,F_SETFD,FD_CLOEXEC);
+    if(!startPowerMonitor()) {
+        NSLog(@"AquaTransport AirDrop: could not register for system sleep/wake notifications");
+        close(listener); return 6;
+    }
     double last_activity=monotonicTime();
     while(!stopping) { @autoreleasepool {
+        drainPowerEvents();
         uid_t console=(uid_t)-1; gid_t group; CFStringRef user=SCDynamicStoreCopyConsoleUser(NULL,&console,&group); if(user) CFRelease(user);
-        reap(&owlPID); reap(&blePID);
+        reap(&owlPID,@"OWL"); reap(&blePID,@"Bluetooth advertiser");
         // Turning Wi-Fi off ends the session; OWL would otherwise keep running on a powered-off radio.
-        if(owner!=(uid_t)-1 && (monotonicTime()>lease || console!=owner || !owlPID || !radioWiFi.powerOn)) radioStop();
+        if(owner!=(uid_t)-1) {
+            NSString *reason=monotonicTime()>lease ? @"lease expired" : console!=owner ? @"console user changed" :
+                !owlPID ? @"OWL exited" : !radioWiFi.powerOn ? @"Wi-Fi is off or unavailable" : nil;
+            if(reason) { NSLog(@"AquaTransport AirDrop: ending radio session: %@",reason); radioStop(); }
+        }
         if(!owlPID && monotonicTime()>last_activity+30) break;
 
         if(owlPID && !blePID) @try { blePID=launch(@"ad_ble_wake",@[@"600"]); } @catch(NSException *e) { radioStop(); }
@@ -95,6 +112,7 @@ int main(void) { @autoreleasepool {
             AQRequire(complete,@"Invalid helper request."); id request=[NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
             AQRequire([request isKindOfClass:[NSDictionary class]] && [request count]==1 && [request[@"command"] isKindOfClass:[NSString class]],@"Invalid helper request."); NSString *command=request[@"command"];
             if([command isEqual:@"start"]) {
+                requireRadioAwake();
                 AQRequire(AQHasTAP(),@"The TAP driver is not installed.");
                 if(!owlPID) {
                     char interface[32]={0}; AQRequire(hardware_supported(interface,sizeof(interface)),@"AirDrop requires an unambiguous Wi-Fi interface and a Bluetooth LE controller.");
@@ -119,19 +137,19 @@ int main(void) { @autoreleasepool {
                         owner=uid; blePID=launch(@"ad_ble_wake",@[@"600"]);
                         BOOL ready=NO;
                         for(int i=0;i<50;i++) {
-                            usleep(100000); reap(&owlPID); reap(&blePID);
+                            usleep(100000); requireRadioAwake(); reap(&owlPID,@"OWL"); reap(&blePID,@"Bluetooth advertiser");
                             if(!owlPID || !blePID) break;
                             if(tapReady()) { ready=YES; break; }
                         }
                         AQRequire(ready,@"The AirDrop radio did not become ready.");
                     } @catch(NSException *e) { radioStop(); @throw; }
                 } lease=monotonicTime()+45;
-            } else if([command isEqual:@"heartbeat"]) { AQRequire(owner==uid && owlPID>0,@"The radio session has ended."); lease=monotonicTime()+45;
+            } else if([command isEqual:@"heartbeat"]) { requireRadioAwake(); AQRequire(owner==uid && owlPID>0,@"The radio session has ended."); lease=monotonicTime()+45;
             } else if([command isEqual:@"stop"]) { if(owner==uid) radioStop();
             } else AQRequire([command isEqual:@"status"],@"Unknown helper command.");
             reply=@{@"ok":@YES,@"running":@(owlPID>0),@"tap":@(AQHasTAP())};
         } @catch(NSException *e) { reply=@{@"ok":@NO,@"error":e.reason ?: @"Radio helper error"}; }
         NSMutableData *out=[[NSJSONSerialization dataWithJSONObject:reply options:0 error:NULL] mutableCopy]; [out appendBytes:"\n" length:1]; write(client,out.bytes,out.length); close(client);
     } }
-    radioStop(); close(listener); return 0;
+    radioStop(); stopPowerMonitor(); close(listener); return 0;
 } }
