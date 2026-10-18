@@ -690,6 +690,43 @@ ClientHello from the next context at the same address. It then releases 1000 con
 `CFRelease` alone while another is set up and waiting, and sends that one's ClientHello.
 `selftest.sh` requires each hello to be a fresh context's, as it is on the stock stack.
 
+### Handshake failures
+
+| the client handshake fails because | `SSLHandshake` returns |
+|---|---|
+| the server sent alert 10 to 100 | that alert's `errSSLPeer*` code, -9819 to -9840 |
+| the server sent an alert with no such code | `errSSLFatalAlert` (-9802) |
+| the certificate failed trust evaluation | `errSSLXCertChainInvalid` (-9807) |
+| the server does not speak TLS | `errSSLProtocol` (-9800) |
+| anything else, a hang-up included | `errSSLClosedAbort` (-9806) |
+
+A caller should get from the engine what the stock stack would tell it, and callers act on these
+codes. The engine used to answer -9806 for every failure, "connection closed via error". Two
+callers broke:
+
+1. System `/usr/bin/curl`, given an expired, self-signed, wrong-host or untrusted-root
+   certificate, said `(35) Server aborted the SSL handshake`. Stock says `(60) SSL certificate
+   problem: Invalid certificate chain`.
+2. Codex's HTTP client falls back to rustls on `errSSLPeerProtocolVersion` (-9836, alert 70),
+   by its message, "bad protocol version". It never fell back.
+
+CFNetwork saw no difference for certificates. It breaks on server authentication and evaluates
+trust itself, so the handshake does not fail in the engine, and NSURLConnection and NSURLSession
+report -1202 with the peer trust attached either way.
+
+The trust row is one code for every reason. Stock 10.9 says -9807 for an expired, a wrong-host,
+a not-yet-valid and an untrusted certificate alike, on local listeners and on badssl.com. It
+does not say `errSSLCertExpired` (-9814) or `errSSLBadCert` (-9808) for any of them.
+
+Two alerts are not in the first row. 41, SSL 3's no_certificate, gives -9806. 0, close_notify,
+is a hang-up.
+
+The hook maps the OpenSSL reason through a table in `aquatransport_hooks_mac.c`. A server-side
+failure keeps -9806, since nothing here measures the stock server.
+
+`tools/errorcontract.c` measures every row on the stock stack, from local listeners that answer
+the ClientHello with fixed bytes. `selftest.sh` requires the engine's answers to match exactly.
+
 ### The one thing that does not match, and why it cannot
 
 Every status and every `*processed` above matches the stock stack. What does not is how many
@@ -1090,6 +1127,9 @@ tools/statecontract.c   # what SSLGetSessionState says at each step of a handsha
 tools/releasecontract.c # what a context released without SSLClose leaves for the next context
                         # at its address, and for a live one when many are released; compared
                         # with the stock stack the same way
+tools/errorcontract.c   # what SSLHandshake returns for each way a handshake can be refused:
+                        # every alert, a bad certificate, a server that is not TLS, a hang-up.
+                        # Local listeners only; compared with the stock stack the same way
 tools/uploadprobe.c     # a POST big enough to fill that buffer, in-memory body or streamed from
                         # a file, blocking reads or run-loop scheduled -- CFNetwork drives writes
                         # differently in each, and reports peak RSS so a write path that grew

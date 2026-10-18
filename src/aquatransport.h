@@ -33,6 +33,16 @@ extern OSStatus SecKeyDecrypt(SecKeyRef key, SecPadding padding,
                               const uint8_t *cipherText, size_t cipherTextLen,
                               uint8_t *plainText, size_t *plainTextLen);
 
+// Shadow session states, separate from Secure Transport's public SSLSessionState.
+// NEW is zero because sh_create allocates the shadow with calloc.
+typedef enum {
+    SH_STATE_FAILED = -1,        // subsequent calls fall back to the native context
+    SH_STATE_NEW = 0,
+    SH_STATE_HANDSHAKING = 1,
+    SH_STATE_CONNECTED = 2,
+    SH_STATE_PEER_AUTH = 3       // waiting for the application's trust decision
+} ShadowState;
+
 typedef struct {
     SSLContextRef    ctx;
     SSLReadFunc      rf;
@@ -46,7 +56,7 @@ typedef struct {
     unsigned char    peerID[256];
     size_t           peerIDLen;
     int              inited;
-    int              state;
+    ShadowState      state;
     // Native-context compatibility answers, frozen at handshake start. These never
     // configure OpenSSL; its wire protocol/ciphers remain independent.
     SSLProtocol      reportedProtocol;
