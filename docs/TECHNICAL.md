@@ -319,7 +319,7 @@ So `src/mac/aquatransport_cfhook.c` replaces the pointer in the class record, wh
 calls through. That is what `method_setImplementation` does for an Objective-C method. The
 interface is shaped like fishhook's, so the hooks read like the rest:
 
-- Rows go in a table beside `kHooks` in `aquatransport_hooks_mac.c`. Each row names the
+- Rows go in `kFinalizers`, beside `kHooks` in `aquatransport_hooks_mac.c`. Each row names the
   class's type-ID function, the name the class must have, a `my_*` replacement and an `o_*`
   original slot.
 - `rebind_cf_finalizers()` belongs in `resolve_origs`, not in the constructor. A class
@@ -655,6 +655,40 @@ CFNetwork asks only before the first `SSLHandshake`, where the native answer is 
 
 `tools/statecontract.c` measures these answers on the stock stack, and `selftest.sh` requires the
 engine's to match them exactly.
+
+### A context released without `SSLClose`
+
+The hooks keep a shadow entry per context, keyed by the context's address. `SSLClose` and
+`SSLDisposeContext` drop it. A caller need not call either: a release is all Secure Transport
+needs. Rust's security-framework, under native-tls, releases with `CFRelease` alone whenever a
+stream is dropped without a shutdown, and a failed handshake always is. CFNetwork does the same
+on some failure paths.
+
+The entry then outlived its context, which cost twice:
+
+1. The allocator gave the address to a later context. That context must behave as a new one,
+   as it does on the stock stack. But it inherited the dead connection's entry. After a failed
+   handshake the entry says state -1, and the hooks hand every handshake in that state to the
+   native stack. So the next connection at that address ran on stock 10.9, which cannot reach
+   api.openai.com or chatgpt.com (-9824).
+2. Entries for dead contexts filled the table, 256 of them, until LRU eviction took the entry
+   of a live one. A context set up and about to handshake then lost its I/O callbacks and its
+   connection, and its handshake went to the native stack too.
+
+So the hook is on the context's destructor. From 10.8 an `SSLContext` is a CF object, and its
+last release calls the destructor its class registered, however that release comes. See
+"Destructors: what fishhook cannot reach" above for how it is hooked. Measured on 10.9.5:
+`CFRelease` alone, `SSLDisposeContext`, and the last release after `SSLClose` each arrive at
+`my_SSLContextFinalize`. It drops the entry, then calls the original, in that order: once the
+context's memory is freed, the address can belong to a new context on another thread.
+
+Before 10.8 there is no `SSLContextGetTypeID`, and no CF type to release. `SSLDisposeContext`
+is the only end a context has, and it drops the entry itself.
+
+`tools/releasecontract.c` fails a handshake, ends the context one way or another, and sends a
+ClientHello from the next context at the same address. It then releases 1000 contexts with
+`CFRelease` alone while another is set up and waiting, and sends that one's ClientHello.
+`selftest.sh` requires each hello to be a fresh context's, as it is on the stock stack.
 
 ### The one thing that does not match, and why it cannot
 
@@ -1053,6 +1087,9 @@ tools/readcontract.c    # starving an IO callback of its own; run against the st
                         # in the socket send buffer never blocks
 tools/statecontract.c   # what SSLGetSessionState says at each step of a handshake that pauses
                         # for server authentication; compared with the stock stack the same way
+tools/releasecontract.c # what a context released without SSLClose leaves for the next context
+                        # at its address, and for a live one when many are released; compared
+                        # with the stock stack the same way
 tools/uploadprobe.c     # a POST big enough to fill that buffer, in-memory body or streamed from
                         # a file, blocking reads or run-loop scheduled -- CFNetwork drives writes
                         # differently in each, and reports peak RSS so a write path that grew
