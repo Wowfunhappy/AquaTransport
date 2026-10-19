@@ -33,6 +33,9 @@ static void resolve_trust_origs(void) {
     o_SecTrustSetAnchorCertificatesOnly =
         (OSStatus (*)(SecTrustRef, Boolean))dlsym(RTLD_DEFAULT, "SecTrustSetAnchorCertificatesOnly");
     g_trust_ok = (o_SecTrustSetAnchorCertificates != NULL);
+    if (!g_trust_ok) tf_log("could not resolve SecTrustSetAnchorCertificates");
+    else if (!o_SecTrustSetAnchorCertificatesOnly)
+        tf_log("SecTrustSetAnchorCertificatesOnly absent; disable-certificate-pinning cannot apply");
 }
 
 // True once the original entry point is resolved. The hook only runs when Security is loaded

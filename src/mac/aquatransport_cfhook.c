@@ -40,7 +40,10 @@ int rebind_cf_finalizers(const struct cf_rebinding rebindings[], size_t rebindin
     for (size_t i = 0; i < rebindings_nel; i++) {
         const struct cf_rebinding *r = &rebindings[i];
         CFTypeID (*type_id)(void) = (CFTypeID (*)(void))dlsym(RTLD_DEFAULT, r->type_id);
-        if (!type_id) continue;                          // not on this system
+        if (!type_id) {                                  // not on this system
+            tf_log("%s absent on this system; its finalize row is inert", r->type_id);
+            continue;
+        }
         CFClassHead *cls = class_of ? class_of(type_id()) : NULL;
         if (!cls || !cls->className || strcmp(cls->className, r->class_name) || !cls->finalize) {
             tf_log("%s: class not as expected; its finalize is not hooked", r->type_id);
@@ -56,6 +59,7 @@ int rebind_cf_finalizers(const struct cf_rebinding rebindings[], size_t rebindin
         if (cls->finalize != (void (*)(CFTypeRef))r->replacement) {
             *r->replaced = (void *)cls->finalize;
             cls->finalize = (void (*)(CFTypeRef))r->replacement;
+            tf_log("%s: %s finalize hooked", r->type_id, r->class_name);
         }
     }
     return rv;

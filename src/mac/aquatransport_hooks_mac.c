@@ -459,6 +459,12 @@ static OSStatus my_SSLDisposeContext(SSLContextRef c) {
 // goes before the context's memory does, since once the original has run, the address can
 // belong to a new context, on another thread, with an entry of its own.
 static void my_SSLContextFinalize(CFTypeRef c) {
+    // An entry still here means neither SSLClose nor SSLDisposeContext ran: the case this hook
+    // exists for, and otherwise invisible.
+    if (tf_debug()) {
+        Shadow *s = sh_get((SSLContextRef)c);
+        if (s) { tf_log("released without SSLClose  host=%s state=%d", s->host[0] ? s->host : "(none)", s->state); sh_release(s); }
+    }
     sh_free((SSLContextRef)c);
     o_SSLContextFinalize(c);
 }
@@ -658,7 +664,11 @@ static void resolve_origs(void) {
     for (size_t i = 0; i < NHOOKS; i++) {
         void *real = dlsym(RTLD_DEFAULT, kHooks[i].name);
         if (!real) {
-            if (kHooks[i].absent) { *(kHooks[i].orig) = kHooks[i].absent; continue; }
+            if (kHooks[i].absent) {
+                tf_log("%s absent on this system; its hook is inert", kHooks[i].name);
+                *(kHooks[i].orig) = kHooks[i].absent;
+                continue;
+            }
             tf_log("could not resolve %s", kHooks[i].name);
             *(kHooks[i].orig) = (void *)st_unavailable;
             ok = 0;
@@ -667,6 +677,7 @@ static void resolve_origs(void) {
         *(kHooks[i].orig) = real;
     }
     g_origs_ok = ok;
+    tf_log(ok ? "Secure Transport resolved" : "Secure Transport incomplete; the engine stays off");
     // Here, with the originals, rather than in install_ssl_hooks: a destructor is reached
     // through its class, which exists only once Secure Transport is loaded. This is the first
     // point at which it is known to be, and it comes before any context this library sees.
