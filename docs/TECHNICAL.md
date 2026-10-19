@@ -305,6 +305,32 @@ Two consequences for anyone editing `src/mac/aquatransport_hooks_mac.c`:
 trust-daemon deny list carries no hooks at all. The per-hook `tf_on()` gate still runs on
 every call: `tf_reentrant()` is dynamic and cannot be decided at install time.
 
+### Destructors: what fishhook cannot reach
+
+fishhook replaces a function where one image calls another's by name. A CoreFoundation
+object's destructor is called no such way. On the last release, CF calls the `finalize`
+function the object's class registered, through the class record handed to
+`_CFRuntimeRegisterClass`. That function is usually static in its framework. Secure
+Transport's, `sslContextDestroy`, is a local symbol that no image imports, so `dlsym` cannot
+find it and fishhook has no call site to rebind. Rebinding `CFRelease` would miss
+CoreFoundation's own releases, which are calls inside its own image.
+
+So `src/mac/aquatransport_cfhook.c` replaces the pointer in the class record, which is what CF
+calls through. That is what `method_setImplementation` does for an Objective-C method. The
+interface is shaped like fishhook's, so the hooks read like the rest:
+
+- Rows go in a table beside `kHooks` in `aquatransport_hooks_mac.c`. Each row names the
+  class's type-ID function, the name the class must have, a `my_*` replacement and an `o_*`
+  original slot.
+- `rebind_cf_finalizers()` belongs in `resolve_origs`, not in the constructor. A class
+  exists only once its framework is loaded, and installing calls the type-ID function,
+  which a constructor or a dyld add-image callback must not do.
+- A row whose type-ID function does not resolve is inert, as an `absent` row of `kHooks` is.
+  That is how a row reads for a class that arrived after 10.6: `SSLContextGetTypeID` is 10.8.
+- A class whose name is not the row's, or whose record is not writable, is logged and left
+  alone.
+- The replacement calls the `o_*` original before returning, like every other hook.
+
 ## Protocol and cipher compatibility reporting
 
 OpenSSL's wire negotiation is independent of the application's Secure Transport
