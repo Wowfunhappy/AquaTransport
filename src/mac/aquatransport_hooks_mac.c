@@ -18,6 +18,10 @@
 //      runs on every call, because tf_reentrant() is dynamic and cannot be decided at install
 //      time.
 //
+// One hook is not fishhook's: a context's destructor, which no image calls by name. It is
+// replaced in the class record CoreFoundation calls it through, by rebind_cf_finalizers, from
+// a table shaped like kHooks. See kFinalizers, and aquatransport_cfhook.h for why.
+//
 // CALLING THE ORIGINAL -- READ THIS BEFORE EDITING
 //
 // Never call a hooked function by name from this file. fishhook rebinds the symbol in
@@ -45,6 +49,7 @@
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include "aquatransport_cfhook.h"
 // The trust infrastructure itself. This is not a list of things that happen to break --
 // it is a circular dependency: our verify path calls SecTrustEvaluate, which these
 // processes implement. Routing their own traffic through that check would make trust
@@ -118,6 +123,8 @@ static OSStatus (*o_SSLGetBufferedReadSize)(SSLContextRef, size_t *);
 static OSStatus (*o_SSLCopyPeerTrust)(SSLContextRef, SecTrustRef *);
 static OSStatus (*o_SSLCopyPeerCertificates)(SSLContextRef, CFArrayRef *);
 static OSStatus (*o_SSLSetCertificate)(SSLContextRef, CFArrayRef);
+// Not an entry point: filled by rebind_cf_finalizers, not dlsym. See kFinalizers.
+static void (*o_SSLContextFinalize)(CFTypeRef);
 
 #include "aquatransport_reporting.inc"
 
@@ -426,15 +433,40 @@ static OSStatus my_SSLClose(SSLContextRef c) {
 }
 
 // A context can reach its end without SSLClose -- a connection abandoned before the
-// handshake finishes is disposed, not closed -- and the shadow entry then lives until LRU
-// eviction. In a long-lived, high-churn process (the shared WebKit networking service is
-// the case that matters) those entries accumulate, lengthening every table scan and
-// eventually evicting slots still in use. Freeing here costs nothing when SSLClose already
-// ran: sh_free on a context with no entry is a no-op.
+// handshake finishes is disposed, not closed. Before 10.8 this is the only end a context has,
+// so the entry goes here. From 10.8 my_SSLContextFinalize drops it too, and the second
+// sh_free finds nothing: on a context with no entry it is a no-op.
 static OSStatus my_SSLDisposeContext(SSLContextRef c) {
     if (!tf_on()) return o_SSLDisposeContext(c);
     sh_free(c);
     return o_SSLDisposeContext(c);
+}
+
+// The end every context reaches from 10.8, when a context became a CF object: its destructor,
+// which CF calls on the last release however that release comes -- CFRelease alone,
+// SSLDisposeContext, or the last release after SSLClose (each measured on 10.9.5). Hooked
+// through the class rather than by name; see kFinalizers.
+//
+// SSLClose and SSLDisposeContext alone are not enough. Rust's security-framework, under
+// native-tls, ends every stream dropped without a shutdown with CFRelease alone, and a failed
+// handshake always is. CFNetwork does on some failure paths too. An entry left behind costs
+// twice. The allocator hands the address to a later context, which inherits the dead
+// connection's state: after a failed handshake, state -1, which sends every handshake on it to
+// the native stack. And entries for dead contexts fill the table, until LRU eviction takes the
+// entry of a live one.
+//
+// Not gated on tf_on(): an entry must go with its context whatever the gate says now. The entry
+// goes before the context's memory does, since once the original has run, the address can
+// belong to a new context, on another thread, with an entry of its own.
+static void my_SSLContextFinalize(CFTypeRef c) {
+    // An entry still here means neither SSLClose nor SSLDisposeContext ran: the case this hook
+    // exists for, and otherwise invisible.
+    if (tf_debug()) {
+        Shadow *s = sh_get((SSLContextRef)c);
+        if (s) { tf_log("released without SSLClose  host=%s state=%d", s->host[0] ? s->host : "(none)", s->state); sh_release(s); }
+    }
+    sh_free((SSLContextRef)c);
+    o_SSLContextFinalize(c);
 }
 
 // Answer kSSLHandshake while the engine is handshaking, as the stock stack does from the first
@@ -600,6 +632,18 @@ static const struct {
 };
 #define NHOOKS (sizeof kHooks / sizeof kHooks[0])
 
+// One row per CF class whose destructor is hooked. A destructor is not an entry point anyone
+// calls by name, so fishhook cannot reach it -- see aquatransport_cfhook.h -- but a row reads
+// like one of kHooks: named by what dlsym resolves, with its replacement and original slot.
+//
+// A row is named by its class's type-ID function, so a class that does not exist on this
+// system leaves its row inert, as an `absent` row in kHooks does. SSLContextGetTypeID arrived
+// in 10.8 along with the CF type; before that, SSLDisposeContext is the only end, and is hooked.
+static const struct cf_rebinding kFinalizers[] = {
+    { "SSLContextGetTypeID", "SSLContext", (void *)my_SSLContextFinalize, (void **)&o_SSLContextFinalize },
+};
+#define NFINALIZERS (sizeof kFinalizers / sizeof kFinalizers[0])
+
 // Resolving the originals is deferred to the first hook call rather than done here, because
 // Secure Transport need not be loaded yet when this runs -- see the note on gating in the
 // header. By the time any of these hooks is entered, the process is calling Secure Transport,
@@ -620,7 +664,11 @@ static void resolve_origs(void) {
     for (size_t i = 0; i < NHOOKS; i++) {
         void *real = dlsym(RTLD_DEFAULT, kHooks[i].name);
         if (!real) {
-            if (kHooks[i].absent) { *(kHooks[i].orig) = kHooks[i].absent; continue; }
+            if (kHooks[i].absent) {
+                tf_log("%s absent on this system; its hook is inert", kHooks[i].name);
+                *(kHooks[i].orig) = kHooks[i].absent;
+                continue;
+            }
             tf_log("could not resolve %s", kHooks[i].name);
             *(kHooks[i].orig) = (void *)st_unavailable;
             ok = 0;
@@ -629,6 +677,11 @@ static void resolve_origs(void) {
         *(kHooks[i].orig) = real;
     }
     g_origs_ok = ok;
+    tf_log(ok ? "Secure Transport resolved" : "Secure Transport incomplete; the engine stays off");
+    // Here, with the originals, rather than in install_ssl_hooks: a destructor is reached
+    // through its class, which exists only once Secure Transport is loaded. This is the first
+    // point at which it is known to be, and it comes before any context this library sees.
+    rebind_cf_finalizers(kFinalizers, NFINALIZERS);
 }
 
 // True once the original entry points are available. A hook may run its own logic only when

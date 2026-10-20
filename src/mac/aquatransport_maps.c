@@ -79,6 +79,7 @@ static void install_eta(void) {
     if (!dladdr(original, &owner) || !owner.dli_fname || !strstr(owner.dli_fname, "/GeoServices.framework/")) return;
     native_write = original;
     set_implementation(method, (void *)&maps_write);
+    tf_log("Maps ETA hook installed");
 }
 static void try_eta(void) {
     pthread_mutex_lock(&hook_lock);
