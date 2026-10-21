@@ -255,7 +255,7 @@ Shadow *sh_get(SSLContextRef c) {
 }
 Shadow *sh_create(SSLContextRef c) {
     Shadow *evicted = NULL; int freeEvicted = 0;
-    const char *evictedHost = NULL; int evictedState = 0;
+    const char *evictedHost = NULL; ShadowState evictedState = SH_STATE_NEW;
     pthread_mutex_lock(&gLock);
     Shadow *s = NULL;
     for (int i = 0; i < MAXSH; i++) if (gTab[i] && gTab[i]->ctx == c) { s = gTab[i]; s->lastUse = ++gClock; s->refcount++; break; }

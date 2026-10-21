@@ -524,12 +524,23 @@ static void my_SSLContextFinalize(CFTypeRef c) {
 // The pause for server authentication is where it matters. Rust's security-framework, under
 // native-tls, asks for the state there, and on kSSLIdle returns errSecBadReq instead of fetching
 // the peer trust. tools/statecontract.c measures the stock answers.
+// The public state for each shadow state, or -1 to ask the native context. A new
+// ShadowState without a case here produces a -Wswitch warning.
+static int sh_session_state(ShadowState state) {
+    switch (state) {
+        case SH_STATE_HANDSHAKING: case SH_STATE_PEER_AUTH: return ST_Handshake;
+        case SH_STATE_CONNECTED:                           return ST_Connected;
+        case SH_STATE_NEW: case SH_STATE_FAILED:           return -1;
+    }
+    return -1;
+}
+
 static OSStatus my_SSLGetSessionState(SSLContextRef c, SSLSessionState *st) {
     if (!tf_on()) return o_SSLGetSessionState(c, st);
     Shadow *s = sh_get(c);
+    int answer = s ? sh_session_state(s->state) : -1;
     OSStatus rv;
-    if (s && s->state == SH_STATE_CONNECTED) { if (st) *st = ST_Connected; rv = noErr; }
-    else if (s && (s->state == SH_STATE_HANDSHAKING || s->state == SH_STATE_PEER_AUTH)) { if (st) *st = ST_Handshake; rv = noErr; }
+    if (answer >= 0) { if (st) *st = (SSLSessionState)answer; rv = noErr; }
     else rv = o_SSLGetSessionState(c, st);
     sh_release(s);
     return rv;
