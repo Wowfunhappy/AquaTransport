@@ -23,6 +23,7 @@ WRITECONTRACT="$DIR/build/writecontract"
 READCONTRACT="$DIR/build/readcontract"
 STATECONTRACT="$DIR/build/statecontract"
 RELEASECONTRACT="$DIR/build/releasecontract"
+ERRORCONTRACT="$DIR/build/errorcontract"
 LATECHECK="$DIR/build/latecheck"
 POOLPROBE="$DIR/build/poolprobe"
 pass=0; fail=0
@@ -72,6 +73,8 @@ fi
     -framework CoreFoundation -framework Security -o "$STATECONTRACT" "$DIR/tools/statecontract.c"
 [ -x "$RELEASECONTRACT" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
     -framework CoreFoundation -framework Security -o "$RELEASECONTRACT" "$DIR/tools/releasecontract.c"
+[ -x "$ERRORCONTRACT" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
+    -framework CoreFoundation -framework Security -o "$ERRORCONTRACT" "$DIR/tools/errorcontract.c"
 
 # Rules used only by the rewrite tests. example.invalid deliberately does not resolve:
 # if the redirect works, DNS is never consulted for it.
@@ -312,6 +315,15 @@ cx_eng=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$RELEASECONTRACT" 2>
 check "released-context contract matches stock" "^identical$" \
   "$([ -n "$cx_stock" ] && [ "$cx_stock" = "$cx_eng" ] && echo identical || echo differs)"
 [ "$cx_stock" = "$cx_eng" ] || diff <(echo "$cx_stock") <(echo "$cx_eng") | sed 's/^/        /'
+
+# The same for what SSLHandshake returns when the handshake fails: one local listener per
+# refusal, each a fixed answer to the ClientHello. Callers branch on the code, as Codex does
+# on -9836 to retry with its own TLS stack. Nothing here uses the network.
+ce_stock=$("$ERRORCONTRACT" 2>&1 | grep -E '^  ')
+ce_eng=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$ERRORCONTRACT" 2>&1 | grep -E '^  ')
+check "handshake-failure contract matches stock" "^identical$" \
+  "$([ -n "$ce_stock" ] && [ "$ce_stock" = "$ce_eng" ] && echo identical || echo differs)"
+[ "$ce_stock" = "$ce_eng" ] || diff <(echo "$ce_stock") <(echo "$ce_eng") | sed 's/^/        /'
 
 echo "== client certificates =="
 # Whether the certificate the client was given actually reaches the server. A client that
