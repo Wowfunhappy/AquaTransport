@@ -277,7 +277,25 @@ progress never sees a partially written file.
 
 ## How the hooks are installed
 
-Both subsystems rebind symbol pointers by name with fishhook (`deps/fishhook/`).
+Both subsystems rebind symbol pointers with the vendored fishhook (`deps/fishhook/`).
+Every registration requires a symbol name **and an explicit list of import providers**.
+For example, `SSLRead` is hooked only when its import names Security.framework; an
+application's import of `SSLRead` from its own library is left untouched.
+
+The matcher uses the library ordinal in the imported symbol's `n_desc` to select the
+dependency load command. It counts normal, weak, reexport, upward and lazy dylib loads
+in order, excluding `LC_ID_DYLIB`, then compares the full install name. Provider lists
+in `src/mac/aquatransport_symbols.h` include CFNetwork's older nested install name and
+the CoreServices umbrella, plus the relevant libSystem reexports. Basenames and path
+substrings are never accepted. Additional reexport umbrellas need an explicit entry;
+unknown providers are skipped. A missing provider list rejects the entire registration.
+
+Flat-namespace images, forced-flat processes, dynamic-lookup/executable/self ordinals,
+weak-coalesced references and absent weak imports are skipped because they do not
+establish a usable two-level provider. This intentionally limits coverage in those
+cases. It is an import-identity check, not protection against a process deliberately
+substituting a library under a system install name. `rebind_symbols_image` additionally
+limits the importing image; it enforces the same provider checks.
 
 Rebinding rewrites call sites rather than function bodies, so the "function too small,
 clobbers adjacent memory" failure that makes `SSLClose` unsafe under body-patching schemes
@@ -291,15 +309,28 @@ used. Both frameworks live in the dyld shared cache, and the cache does not prev
 
 Two consequences for anyone editing `src/mac/aquatransport_hooks_mac.c`:
 
-- **Never call a hooked function by name from that file.** fishhook rebinds the symbol in
-  every loaded image including our own, so `SSLHandshake(c)` lands back in the replacement
-  and recurses until the process dies. Call through the `o_SSLHandshake` pointer. For the
-  same reason, `dlsym(RTLD_NEXT, ...)` resolves back to the replacement and must not be used.
-- **The `o_*` originals come from `dlsym(RTLD_DEFAULT)`, not from fishhook's `replaced`
+- **Never call a hooked function by name from that file.** fishhook rebinds Security
+  imports in every eligible image including our own, so `SSLHandshake(c)` lands back in
+  the replacement and recurses until the process dies. Call through the `o_SSLHandshake`
+  pointer, filled by the provider-scoped resolver below.
+- **The `o_*` originals come from `fishhook_resolve(providers, name)`, not fishhook's `replaced`
   output.** fishhook reports whatever value was in the symbol slot, and for a lazy symbol
   that has never been called that value is dyld's stub helper rather than the function.
-  `dlsym` resolves through the symbol table and is correct whether or not the symbol has
-  ever been bound.
+  `fishhook_resolve` uses `dlopen(RTLD_NOLOAD | RTLD_FIRST | RTLD_LOCAL | RTLD_LAZY)` and
+  `dlsym` on that handle, balancing the temporary reference with `dlclose`. It searches
+  only that provider's exports (including actual reexports), never ordinary dependencies
+  or the global namespace, and does not load an absent framework. Resolve outside dyld
+  callbacks, and keep the provider loaded while using its function pointers. Both
+  `RTLD_DEFAULT` and `RTLD_NEXT` are inappropriate here: another image can export the
+  same name. Hiding AquaTransport's own exports does not prevent that collision.
+
+`bash tools/test-fishhook.sh [path/to/aquatransport_engine.dylib]` tests duplicate symbol
+names in two different providers on i386 and x86_64, including providers with identical
+basenames. It covers bound and unbound lazy slots, non-lazy slots, weak imports, approved
+and unapproved reexport umbrellas, image-specific and late-load rebinding, flat/dynamic
+lookup exclusions, and provider-scoped original lookup. With an engine path, it also
+checks that unrelated `SSLRead` and CFNetwork imports survive, and that real system
+calls still work when the executable exports conflicting original-function names.
 
 `install_ssl_hooks()` decides per process whether to install anything, so a process on the
 trust-daemon deny list carries no hooks at all. The per-hook `tf_on()` gate still runs on
@@ -320,8 +351,8 @@ calls through. That is what `method_setImplementation` does for an Objective-C m
 interface is shaped like fishhook's, so the hooks read like the rest:
 
 - Rows go in `kFinalizers`, beside `kHooks` in `aquatransport_hooks_mac.c`. Each row names the
-  class's type-ID function, the name the class must have, a `my_*` replacement and an `o_*`
-  original slot.
+  class's type-ID function and its providers, the name the class must have, a `my_*`
+  replacement and an `o_*` original slot.
 - `rebind_cf_finalizers()` belongs in `resolve_origs`, not in the constructor. A class
   exists only once its framework is loaded, and installing calls the type-ID function,
   which a constructor or a dyld add-image callback must not do.

@@ -12,7 +12,7 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 #include <dlfcn.h>
-#include "../../../deps/fishhook/fishhook.h"
+#include "../aquatransport_symbols.h"
 
 typedef const void *AQRequest;
 static void (*original_start)(id,SEL),(*original_stop)(id,SEL),(*original_request)(id,SEL,AQRequest);
@@ -244,17 +244,21 @@ __attribute__((constructor)) static void install_airdrop(void) { @autoreleasepoo
     Ivar air_drop=class_getInstanceVariable(NSClassFromString(@"SDBonjourBrowser"),"_isAirDrop");
     if(!start || !stop || !request || !browser_start || !browser_stop || !air_drop || strcmp(ivar_getTypeEncoding(air_drop),"c") || !checked_method(@"SDWormholeConnection","enqueueResponse:code:body:","v40@0:8^{_CFHTTPServerRequest=}16q24^{__CFData=}32")) return;
     browser_airdrop_offset=ivar_getOffset(air_drop);
-#define RESOLVE(variable,symbol) variable=dlsym(RTLD_DEFAULT,symbol); if(!variable) return
-    RESOLVE(original_browse,"DNSServiceBrowse"); RESOLVE(original_resolve,"DNSServiceResolve"); RESOLVE(original_register,"DNSServiceRegister"); RESOLVE(original_query,"DNSServiceQueryRecord");
-    RESOLVE(original_net_register,"CFNetServiceRegisterWithOptions"); RESOLVE(request_property,"_CFHTTPServerRequestCopyProperty"); RESOLVE(original_response,"_CFHTTPServerResponseCreateWithData");
-    RESOLVE(original_set_txt,"CFNetServiceSetTXTData");
-    RESOLVE(original_bom_copy,"BOMCopierCopyWithOptions"); RESOLVE(bom_user_data,"BOMCopierUserData");
-    RESOLVE(original_connect,"connect"); RESOLVE(original_connectx,"connectx");
-    RESOLVE(original_create_connection,"CFURLConnectionCreateWithProperties");
-    RESOLVE(copy_mutable_request,"CFURLRequestCreateMutableCopy"); RESOLVE(set_request_header,"CFURLRequestSetHTTPHeaderFieldValue");
-    RESOLVE(response_message,"CFURLResponseGetHTTPResponse");
-    RESOLVE(server_connection_invalidate,"_CFHTTPServerConnectionInvalidate");
-    CFStringRef *url=dlsym(RTLD_DEFAULT,"_kCFHTTPServerRequestURL"); if(!url) return; request_url=*url;
+#define RESOLVE(providers,variable,symbol) variable=fishhook_resolve(providers,symbol); if(!variable) return
+    RESOLVE(tf_dnssd_providers,original_browse,"DNSServiceBrowse"); RESOLVE(tf_dnssd_providers,original_resolve,"DNSServiceResolve");
+    RESOLVE(tf_dnssd_providers,original_register,"DNSServiceRegister"); RESOLVE(tf_dnssd_providers,original_query,"DNSServiceQueryRecord");
+    RESOLVE(tf_cfnetwork_providers,original_net_register,"CFNetServiceRegisterWithOptions");
+    RESOLVE(tf_cfnetwork_providers,request_property,"_CFHTTPServerRequestCopyProperty");
+    RESOLVE(tf_cfnetwork_providers,original_response,"_CFHTTPServerResponseCreateWithData");
+    RESOLVE(tf_cfnetwork_providers,original_set_txt,"CFNetServiceSetTXTData");
+    RESOLVE(tf_bom_providers,original_bom_copy,"BOMCopierCopyWithOptions"); RESOLVE(tf_bom_providers,bom_user_data,"BOMCopierUserData");
+    RESOLVE(tf_socket_providers,original_connect,"connect"); RESOLVE(tf_socket_providers,original_connectx,"connectx");
+    RESOLVE(tf_cfnetwork_providers,original_create_connection,"CFURLConnectionCreateWithProperties");
+    RESOLVE(tf_cfnetwork_providers,copy_mutable_request,"CFURLRequestCreateMutableCopy");
+    RESOLVE(tf_cfnetwork_providers,set_request_header,"CFURLRequestSetHTTPHeaderFieldValue");
+    RESOLVE(tf_cfnetwork_providers,response_message,"CFURLResponseGetHTTPResponse");
+    RESOLVE(tf_cfnetwork_providers,server_connection_invalidate,"_CFHTTPServerConnectionInvalidate");
+    CFStringRef *url=fishhook_resolve(tf_cfnetwork_providers,"_kCFHTTPServerRequestURL"); if(!url) return; request_url=*url;
 #undef RESOLVE
     radio_lock=[NSLock new];
     radio_owners=[NSHashTable weakObjectsHashTable];
@@ -275,11 +279,21 @@ __attribute__((constructor)) static void install_airdrop(void) { @autoreleasepoo
         (void)note;
         retry_pending_radio([IOBluetoothHostController defaultController].powerState==kBluetoothHCIPowerStateON && wifi_powered());
     }];
-    struct rebinding hooks[]={ {"DNSServiceBrowse",(void *)&browse,NULL},{"DNSServiceResolve",(void *)&resolve,NULL},{"DNSServiceRegister",(void *)&register_service,NULL},{"DNSServiceQueryRecord",(void *)&query,NULL},{"CFNetServiceRegisterWithOptions",(void *)&register_net_service,NULL},{"CFNetServiceSetTXTData",(void *)&set_txt,NULL},{"_CFHTTPServerResponseCreateWithData",(void *)&response,NULL},{"connect",(void *)&scoped_connect,NULL},{"connectx",(void *)&scoped_connectx,NULL} };
+    struct rebinding hooks[]={
+        {"DNSServiceBrowse",(void *)&browse,NULL,tf_dnssd_providers},
+        {"DNSServiceResolve",(void *)&resolve,NULL,tf_dnssd_providers},
+        {"DNSServiceRegister",(void *)&register_service,NULL,tf_dnssd_providers},
+        {"DNSServiceQueryRecord",(void *)&query,NULL,tf_dnssd_providers},
+        {"CFNetServiceRegisterWithOptions",(void *)&register_net_service,NULL,tf_cfnetwork_providers},
+        {"CFNetServiceSetTXTData",(void *)&set_txt,NULL,tf_cfnetwork_providers},
+        {"_CFHTTPServerResponseCreateWithData",(void *)&response,NULL,tf_cfnetwork_providers},
+        {"connect",(void *)&scoped_connect,NULL,tf_socket_providers},
+        {"connectx",(void *)&scoped_connectx,NULL,tf_socket_providers}
+    };
     if(rebind_symbols(hooks,sizeof(hooks)/sizeof(hooks[0]))) return;
-    struct rebinding outgoing={"CFURLConnectionCreateWithProperties",(void *)&create_connection,NULL};
+    struct rebinding outgoing={"CFURLConnectionCreateWithProperties",(void *)&create_connection,NULL,tf_cfnetwork_providers};
     if(rebind_symbols(&outgoing,1)) return;
-    struct rebinding incoming={"BOMCopierCopyWithOptions",(void *)&incoming_bom_copy,NULL};
+    struct rebinding incoming={"BOMCopierCopyWithOptions",(void *)&incoming_bom_copy,NULL,tf_bom_providers};
     if(rebind_symbols(&incoming,1)) return;
     original_zipper_copy=(void *)method_setImplementation(zipper_copy,(IMP)incoming_copy);
     original_publication_callback=(void *)method_setImplementation(publication,(IMP)publication_callback);

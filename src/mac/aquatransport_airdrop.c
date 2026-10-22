@@ -4,7 +4,7 @@
 #include "aquatransport_airdrop.h"
 #include "aquatransport_airdrop_policy.h"
 #include "aquatransport_config.h"
-#include "../../deps/fishhook/fishhook.h"
+#include "aquatransport_symbols.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <mach-o/dyld.h>
@@ -111,8 +111,8 @@ void tf_airdrop_install(void) {
     }
     if(
        !aq_airdrop_platform_supported((unsigned)atoi(os.release),sizeof(void *),executable,tap_available()) || tf_flag("disable-modern-airdrop")) return;
-    native_cache_limit=dlsym(RTLD_DEFAULT,"_CFNetworkHTTPConnectionCacheSetLimit");
+    native_cache_limit=fishhook_resolve(tf_cfnetwork_providers,"_CFNetworkHTTPConnectionCacheSetLimit");
     if(!native_cache_limit) return;
-    struct rebinding hook={"_CFNetworkHTTPConnectionCacheSetLimit",(void *)&air_drop_cache_limit,NULL};
+    struct rebinding hook={"_CFNetworkHTTPConnectionCacheSetLimit",(void *)&air_drop_cache_limit,NULL,tf_cfnetwork_providers};
     rebind_symbols(&hook,1);
 }

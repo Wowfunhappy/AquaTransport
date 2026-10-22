@@ -12,12 +12,12 @@
 //
 // CALLING THE ORIGINAL -- as in the SSL hooks, never call SecTrustSetAnchorCertificates by
 // name from here: fishhook has rebound it in every image, including this one, so the name now
-// resolves to the replacement. o_SecTrustSetAnchorCertificates comes from dlsym(RTLD_DEFAULT),
-// which resolves through the symbol table to the real implementation.
+// resolves to the replacement. o_SecTrustSetAnchorCertificates is resolved only
+// through Security's exports, so another library cannot supply the original.
 
 #include "../aquatransport.h"
 #include "aquatransport_config.h"
-#include "../../deps/fishhook/fishhook.h"
+#include "aquatransport_symbols.h"
 #include <pthread.h>
 #include <dlfcn.h>
 
@@ -29,9 +29,9 @@ static int g_trust_ok = 0;
 
 static void resolve_trust_origs(void) {
     o_SecTrustSetAnchorCertificates =
-        (OSStatus (*)(SecTrustRef, CFArrayRef))dlsym(RTLD_DEFAULT, "SecTrustSetAnchorCertificates");
+        (OSStatus (*)(SecTrustRef, CFArrayRef))fishhook_resolve(tf_security_providers, "SecTrustSetAnchorCertificates");
     o_SecTrustSetAnchorCertificatesOnly =
-        (OSStatus (*)(SecTrustRef, Boolean))dlsym(RTLD_DEFAULT, "SecTrustSetAnchorCertificatesOnly");
+        (OSStatus (*)(SecTrustRef, Boolean))fishhook_resolve(tf_security_providers, "SecTrustSetAnchorCertificatesOnly");
     g_trust_ok = (o_SecTrustSetAnchorCertificates != NULL);
     if (!g_trust_ok) tf_log("could not resolve SecTrustSetAnchorCertificates");
     else if (!o_SecTrustSetAnchorCertificatesOnly)
@@ -71,5 +71,6 @@ void tf_trust_install(void) {
     r[0].name        = "SecTrustSetAnchorCertificates";
     r[0].replacement = (void *)my_SecTrustSetAnchorCertificates;
     r[0].replaced    = NULL;
+    r[0].providers   = tf_security_providers;
     rebind_symbols(r, 1);
 }

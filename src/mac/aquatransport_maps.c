@@ -3,7 +3,7 @@
  * the separate module loads when that method or a map URL is actually used. */
 #include "aquatransport_maps.h"
 #include "aquatransport_config.h"
-#include "../../deps/fishhook/fishhook.h"
+#include "aquatransport_symbols.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
@@ -103,9 +103,9 @@ static void *maps_dlopen(const char *path, int flags) {
 }
 void tf_maps_install(void) {
     if (maps_supported() && !tf_flag("disable-maps-fixes")) {
-        native_dlopen=dlsym(RTLD_DEFAULT,"dlopen");
+        native_dlopen=fishhook_resolve(tf_dlopen_providers,"dlopen");
         if (!native_dlopen) return;
-        struct rebinding hook={"dlopen", (void *)&maps_dlopen, NULL};
+        struct rebinding hook={"dlopen", (void *)&maps_dlopen, NULL, tf_dlopen_providers};
         rebind_symbols(&hook,1);
         _dyld_register_func_for_add_image(maps_image);
     }

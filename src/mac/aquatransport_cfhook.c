@@ -2,6 +2,7 @@
 
 #include "aquatransport_cfhook.h"
 #include "aquatransport_config.h"
+#include "aquatransport_symbols.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #include <string.h>
@@ -35,11 +36,11 @@ int rebind_cf_finalizers(const struct cf_rebinding rebindings[], size_t rebindin
     // Private, though exported. Resolved rather than linked, so a system without it leaves the
     // rows inert instead of the library failing to load.
     CFClassHead *(*class_of)(CFTypeID) =
-        (CFClassHead *(*)(CFTypeID))dlsym(RTLD_DEFAULT, "_CFRuntimeGetClassWithTypeID");
+        (CFClassHead *(*)(CFTypeID))fishhook_resolve(tf_corefoundation_providers, "_CFRuntimeGetClassWithTypeID");
     int rv = 0;
     for (size_t i = 0; i < rebindings_nel; i++) {
         const struct cf_rebinding *r = &rebindings[i];
-        CFTypeID (*type_id)(void) = (CFTypeID (*)(void))dlsym(RTLD_DEFAULT, r->type_id);
+        CFTypeID (*type_id)(void) = (CFTypeID (*)(void))fishhook_resolve(r->providers, r->type_id);
         if (!type_id) {                                  // not on this system
             tf_log("%s absent on this system; its finalize row is inert", r->type_id);
             continue;

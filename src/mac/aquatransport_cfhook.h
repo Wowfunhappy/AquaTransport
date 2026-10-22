@@ -23,6 +23,7 @@ struct cf_rebinding {
     const char *class_name;   // what the class calls itself, checked before anything is written
     void       *replacement;  // takes the object, and must call *replaced before returning
     void      **replaced;     // receives the original finalize; left NULL if nothing was hooked
+    const char *const *providers; // exact providers of the type-ID function
 };
 
 // For each row, replaces its class's finalize with the replacement. A row whose type_id cannot

@@ -39,21 +39,28 @@ extern "C" {
 
 /*
  * A structure representing a particular intended rebinding from a symbol
- * name to its replacement
+ * name and import provider to its replacement. providers is a required,
+ * NULL-terminated list of exact Mach-O dependency install names. The list and
+ * strings must outlive the registration (normally static storage). There is no
+ * name-only mode: an absent/empty provider list makes registration fail.
  */
 struct rebinding {
   const char *name;
   void *replacement;
   void **replaced;
+  const char *const *providers;
 };
 
 /*
  * For each rebinding in rebindings, rebinds references to external, indirect
- * symbols with the specified name to instead point at replacement for each
+ * symbols with the specified name AND a two-level library ordinal naming one
+ * of providers to instead point at replacement for each
  * image in the calling process as well as for all future images that are loaded
  * by the process. If rebind_functions is called more than once, the symbols to
  * rebind are added to the existing list of rebindings, and if a given symbol
  * is rebound more than once, the later rebinding will take precedence.
+ * Flat-namespace, dynamic-lookup, executable/self and weak-coalesced references
+ * are left alone. Returns -1 for invalid registrations or allocation failure.
  */
 FISHHOOK_VISIBILITY
 int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel);
@@ -68,9 +75,18 @@ int rebind_symbols_image(void *header,
                          struct rebinding rebindings[],
                          size_t rebindings_nel);
 
+/*
+ * Resolve through already-loaded providers using RTLD_NOLOAD | RTLD_FIRST.
+ * Searches each provider's exports (including its reexports), never the global
+ * namespace or ordinary dependencies, and never loads a missing framework.
+ * Call outside dyld add-image callbacks. The caller must keep the provider loaded
+ * while using the returned pointer; the temporary dlopen reference is balanced.
+ */
+FISHHOOK_VISIBILITY
+void *fishhook_resolve(const char *const providers[], const char *name);
+
 #ifdef __cplusplus
 }
 #endif //__cplusplus
 
 #endif //fishhook_h
-

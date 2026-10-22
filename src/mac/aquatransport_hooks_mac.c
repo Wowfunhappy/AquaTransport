@@ -1,8 +1,8 @@
 #include "aquatransport_airdrop.h"
 // macOS hook layer for AquaTransport (10.6 - 10.9).
 //
-// Hooks are installed with fishhook, which rebinds symbol pointers by name. Properties this
-// relies on:
+// Hooks are installed with fishhook, which matches symbol names and import providers.
+// Properties this relies on:
 //
 //   1. Rebinding rewrites call sites instead of patching function bodies, so the
 //      "function too small, clobbers adjacent memory" problem does not arise and
@@ -25,21 +25,21 @@
 // CALLING THE ORIGINAL -- READ THIS BEFORE EDITING
 //
 // Never call a hooked function by name from this file. fishhook rebinds the symbol in
-// EVERY loaded image, including this one, so `SSLHandshake(c)` here would land back in
+// every image importing Secure Transport, including this one, so `SSLHandshake(c)` lands in
 // my_SSLHandshake and recurse until the process dies. Always call through o_SSLHandshake.
-// For the same reason, never use dlsym(RTLD_NEXT, ...) to reach an original: it resolves
-// back to the replacement.
+// Resolve originals only through Security's exports; RTLD_DEFAULT/RTLD_NEXT do not
+// constrain the lookup to the intended provider.
 //
-// The o_* pointers come from dlsym(RTLD_DEFAULT), not from fishhook's `replaced` output.
+// The o_* pointers come from fishhook_resolve(tf_security_providers, ...), not `replaced`.
 // That is deliberate. fishhook reports whatever value was sitting in the symbol slot, and
 // for a lazy symbol that has not been called yet that value is dyld's stub binder helper,
-// not the function. dlsym resolves through the symbol table and always yields the real
-// implementation, whether or not the symbol has ever been bound.
+// not the function. Provider-scoped dlsym resolves the exported implementation without
+// confusing another library's identically named function with Secure Transport.
 
 #include "../aquatransport.h"
 #include "aquatransport_config.h"
 #include "aquatransport_gsa_mail.h"
-#include "../../deps/fishhook/fishhook.h"
+#include "aquatransport_symbols.h"
 #include <openssl/err.h>
 #include <pthread.h>
 #include <string.h>
@@ -100,7 +100,7 @@ static inline int tf_on(void) {
     return g_on && !tf_reentrant();
 }
 
-// The real Secure Transport entry points. Resolved before any rebinding; see the header
+// The real Secure Transport entry points. Resolved at first use; see the header
 // comment for why these exist and why they are not fishhook's `replaced` output.
 static SSLContextRef (*o_SSLCreateContext)(CFAllocatorRef, SSLProtocolSide, SSLConnectionType);
 static OSStatus (*o_SSLNewContext)(Boolean, SSLContextRef *);
@@ -643,8 +643,8 @@ static OSStatus my_SSLSetCertificate(SSLContextRef c, CFArrayRef certRefs) {
     return o_SSLSetCertificate(c, certRefs);
 }
 
-// One row per hooked entry point. The original slot is filled from dlsym before anything
-// is rebound, so an installed hook always has a working original to call through.
+// One row per hooked entry point. The original slot is filled by provider-scoped
+// dlsym at the first hook call, before the hook uses its original.
 //
 // A row carrying an `absent` stand-in is one whose entry point is not on every system in the
 // 10.6-10.9 range: SSLCreateContext arrived in 10.8. Where the symbol is missing that row alone
@@ -699,7 +699,7 @@ static const struct {
 // system leaves its row inert, as an `absent` row in kHooks does. SSLContextGetTypeID arrived
 // in 10.8 along with the CF type; before that, SSLDisposeContext is the only end, and is hooked.
 static const struct cf_rebinding kFinalizers[] = {
-    { "SSLContextGetTypeID", "SSLContext", (void *)my_SSLContextFinalize, (void **)&o_SSLContextFinalize },
+    { "SSLContextGetTypeID", "SSLContext", (void *)my_SSLContextFinalize, (void **)&o_SSLContextFinalize, tf_security_providers },
 };
 #define NFINALIZERS (sizeof kFinalizers / sizeof kFinalizers[0])
 
@@ -708,20 +708,19 @@ static const struct cf_rebinding kFinalizers[] = {
 // header. By the time any of these hooks is entered, the process is calling Secure Transport,
 // so the whole framework is loaded and every one of these resolves.
 //
-// RTLD_DEFAULT rather than a handle, and safe at any point: this dylib exports no symbols at
-// all (-exported_symbols_list of an empty file), so dlsym can never hand back one of our own
-// replacements. That is also why RTLD_NEXT must never be used -- it would.
+// Only Security's exports are searched. NOLOAD preserves deferred loading; FIRST
+// excludes unrelated dependencies even if they export a matching name.
 static pthread_once_t g_origs_once = PTHREAD_ONCE_INIT;
 static int g_origs_ok = 0;
 
 static void resolve_origs(void) {
     native_protocol_min = (OSStatus (*)(SSLContextRef, SSLProtocol *))
-        dlsym(RTLD_DEFAULT, "SSLGetProtocolVersionMin");
+        fishhook_resolve(tf_security_providers, "SSLGetProtocolVersionMin");
     native_protocol_max = (OSStatus (*)(SSLContextRef, SSLProtocol *))
-        dlsym(RTLD_DEFAULT, "SSLGetProtocolVersionMax");
+        fishhook_resolve(tf_security_providers, "SSLGetProtocolVersionMax");
     int ok = 1;
     for (size_t i = 0; i < NHOOKS; i++) {
-        void *real = dlsym(RTLD_DEFAULT, kHooks[i].name);
+        void *real = fishhook_resolve(tf_security_providers, kHooks[i].name);
         if (!real) {
             if (kHooks[i].absent) {
                 tf_log("%s absent on this system; its hook is inert", kHooks[i].name);
@@ -757,10 +756,11 @@ static void install_ssl_hooks(void) {
         r[i].name        = kHooks[i].name;
         r[i].replacement = kHooks[i].repl;
         r[i].replaced    = NULL;   // see header comment: fishhook's value is not the function
+        r[i].providers   = tf_security_providers;
     }
 
-    // Rebinding by name needs nothing to be loaded: a process with no Secure Transport simply
-    // has no call sites to rewrite. fishhook also arms a dyld add-image callback, so a
+    // Matching name + import ordinal needs no symbol resolution: unrelated SSLRead
+    // imports are left alone. fishhook also arms a dyld add-image callback, so a
     // framework that arrives later -- including Security.framework itself -- gets rebound the
     // moment it is loaded. That is what makes installing unconditionally here correct, and it
     // is an event, not a wait: nothing anywhere has to predict when Security will show up.
