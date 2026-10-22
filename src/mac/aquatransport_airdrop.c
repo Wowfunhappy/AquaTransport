@@ -93,6 +93,7 @@ static void load_adapter(void) {
         int (*installed)(void)=dlsym(module,"AQAirDropInstalled");
         modern_active=dlsym(module,"AQAirDropModernActive");
         adapter_active=installed && installed();
+        tf_log("AirDrop adapter loaded, %s",adapter_active ? "active" : "inactive");
     }
     if(!module && tf_debug()) tf_log("AirDrop adapter unavailable: %s",dlerror());
 }

@@ -18,6 +18,10 @@
 //      runs on every call, because tf_reentrant() is dynamic and cannot be decided at install
 //      time.
 //
+// One hook is not fishhook's: a context's destructor, which no image calls by name. It is
+// replaced in the class record CoreFoundation calls it through, by rebind_cf_finalizers, from
+// a table shaped like kHooks. See kFinalizers, and aquatransport_cfhook.h for why.
+//
 // CALLING THE ORIGINAL -- READ THIS BEFORE EDITING
 //
 // Never call a hooked function by name from this file. fishhook rebinds the symbol in
@@ -45,6 +49,7 @@
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include "aquatransport_cfhook.h"
 // The trust infrastructure itself. This is not a list of things that happen to break --
 // it is a circular dependency: our verify path calls SecTrustEvaluate, which these
 // processes implement. Routing their own traffic through that check would make trust
@@ -118,6 +123,8 @@ static OSStatus (*o_SSLGetBufferedReadSize)(SSLContextRef, size_t *);
 static OSStatus (*o_SSLCopyPeerTrust)(SSLContextRef, SecTrustRef *);
 static OSStatus (*o_SSLCopyPeerCertificates)(SSLContextRef, CFArrayRef *);
 static OSStatus (*o_SSLSetCertificate)(SSLContextRef, CFArrayRef);
+// Not an entry point: filled by rebind_cf_finalizers, not dlsym. See kFinalizers.
+static void (*o_SSLContextFinalize)(CFTypeRef);
 
 #include "aquatransport_reporting.inc"
 
@@ -189,7 +196,7 @@ static OSStatus my_SSLSetPeerDomainName(SSLContextRef c, const char *name, size_
             size_t n = len < 255 ? len : 255; memcpy(s->host, name, n); s->host[n] = 0;
             // late SNI -> re-init; the cached trust goes too, since a new handshake means a
             // new peer chain, and so does everything the write side was holding for the old one.
-            if (s->inited && s->state != -1) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = 0;
+            if (s->inited && s->state != SH_STATE_FAILED) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = SH_STATE_NEW;
                  sh_reset_write(s);
                  if (s->trust) { CFRelease(s->trust); s->trust = NULL; } }
         }
@@ -250,19 +257,66 @@ static OSStatus my_SSLSetEnableCertVerify(SSLContextRef c, Boolean enable) {
 
 static int server_tls_enabled(void) { return !tf_flag("disable-server-tls") && (tf_airdrop_active() || tf_flag("enable-server-tls")); }
 
+// What the stock stack returns when a client handshake fails, by the OpenSSL reason. Callers
+// act on the code: Codex's HTTP client retries with its own TLS stack on
+// errSSLPeerProtocolVersion, and not on errSSLClosedAbort.
+//
+// tools/errorcontract.c measures every row on the stock stack. A received alert is its
+// errSSLPeer* code, and an alert with none is errSSLFatalAlert. Any trust failure is
+// errSSLXCertChainInvalid, expired and wrong-host certificates included. Anything else stays
+// errSSLClosedAbort, which is also what stock says for a peer that hangs up mid-handshake.
+// Unlisted alert descriptions remain zero, meaning errSSLFatalAlert.
+static const OSStatus kAlertStatus[256] = {
+    [SSL_AD_UNEXPECTED_MESSAGE] = errSSLPeerUnexpectedMsg,
+    [SSL_AD_BAD_RECORD_MAC] = errSSLPeerBadRecordMac,
+    [SSL_AD_DECRYPTION_FAILED] = errSSLPeerDecryptionFail,
+    [SSL_AD_RECORD_OVERFLOW] = errSSLPeerRecordOverflow,
+    [SSL_AD_DECOMPRESSION_FAILURE] = errSSLPeerDecompressFail,
+    [SSL_AD_HANDSHAKE_FAILURE] = errSSLPeerHandshakeFail,
+    [SSL_AD_NO_CERTIFICATE] = ST_ClosedAbort,   // SSL 3's own alert
+    [SSL_AD_BAD_CERTIFICATE] = errSSLPeerBadCert,
+    [SSL_AD_UNSUPPORTED_CERTIFICATE] = errSSLPeerUnsupportedCert,
+    [SSL_AD_CERTIFICATE_REVOKED] = errSSLPeerCertRevoked,
+    [SSL_AD_CERTIFICATE_EXPIRED] = errSSLPeerCertExpired,
+    [SSL_AD_CERTIFICATE_UNKNOWN] = errSSLPeerCertUnknown,
+    [SSL_AD_ILLEGAL_PARAMETER] = errSSLIllegalParam,
+    [SSL_AD_UNKNOWN_CA] = errSSLPeerUnknownCA,
+    [SSL_AD_ACCESS_DENIED] = errSSLPeerAccessDenied,
+    [SSL_AD_DECODE_ERROR] = errSSLPeerDecodeError,
+    [SSL_AD_DECRYPT_ERROR] = errSSLPeerDecryptError,
+    [SSL_AD_EXPORT_RESTRICTION] = errSSLPeerExportRestriction,
+    [SSL_AD_PROTOCOL_VERSION] = errSSLPeerProtocolVersion,
+    [SSL_AD_INSUFFICIENT_SECURITY] = errSSLPeerInsufficientSecurity,
+    [SSL_AD_INTERNAL_ERROR] = errSSLPeerInternalError,
+    [SSL_AD_USER_CANCELLED] = errSSLPeerUserCancelled,
+    [SSL_AD_NO_RENEGOTIATION] = errSSLPeerNoRenegotiation,
+};
+
+static OSStatus handshake_failure_status(unsigned long oe) {
+    if (ERR_GET_LIB(oe) != ERR_LIB_SSL) return ST_ClosedAbort;
+    int reason = ERR_GET_REASON(oe);
+    if (reason == SSL_R_CERTIFICATE_VERIFY_FAILED) return errSSLXCertChainInvalid;
+    if (reason == SSL_R_WRONG_VERSION_NUMBER)      return errSSLProtocol;    // not TLS at all
+    // OpenSSL reports an alert it received as the reason SSL_AD_REASON_OFFSET + description.
+    int alert = reason - SSL_AD_REASON_OFFSET;
+    if (alert <= 0 || alert > 255) return ST_ClosedAbort;
+    OSStatus status = kAlertStatus[alert];
+    return status ? status : errSSLFatalAlert;
+}
+
 static OSStatus my_SSLHandshake(SSLContextRef c) {
     if (!tf_on()) return o_SSLHandshake(c);
     Shadow *s = sh_get(c);
     if (!s) return o_SSLHandshake(c);
     OSStatus rv;
-    if (!s->rf || !s->wf || !s->conn || s->clientBypass || (s->serverSide && (!server_tls_enabled() || s->serverBypass || !s->clientX509)) || s->state == -1) { rv = o_SSLHandshake(c); goto done; }
+    if (!s->rf || !s->wf || !s->conn || s->clientBypass || (s->serverSide && (!server_tls_enabled() || s->serverBypass || !s->clientX509)) || s->state == SH_STATE_FAILED) { rv = o_SSLHandshake(c); goto done; }
     sh_unblock_write(s);   // an entry like any other; see bio_bwrite
     if (!s->inited) {
         capture_reporting(s);
-        if (ossl_init(s)) { s->state = -1; rv = o_SSLHandshake(c); goto done; }
-        s->state = 1;
+        if (ossl_init(s)) { s->state = SH_STATE_FAILED; rv = o_SSLHandshake(c); goto done; }
+        s->state = SH_STATE_HANDSHAKING;
     }
-    if (s->state == 3) s->approved = 1;   // app approved the server after the auth break, let it proceed
+    if (s->state == SH_STATE_PEER_AUTH) s->approved = 1;   // app approved the server after the auth break, let it proceed
     ERR_clear_error();                    // see the note above my_SSLRead
     int ret = SSL_do_handshake(s->ssl);
     if (ret == 1) {
@@ -275,12 +329,12 @@ static OSStatus my_SSLHandshake(SSLContextRef c) {
                    s->breakAuth ? " [app-verified]" : "",
                    pc ? sk_X509_num(pc) : -1); }
         // server-auth-only pinning has no client-cert pause point, so ask the app here (once) before connecting
-        if (!s->serverSide && s->breakAuth && !s->approved) { s->state = 3; rv = ST_PeerAuth; goto done; }
-        s->state = 2; rv = noErr; goto done;
+        if (!s->serverSide && s->breakAuth && !s->approved) { s->state = SH_STATE_PEER_AUTH; rv = ST_PeerAuth; goto done; }
+        s->state = SH_STATE_CONNECTED; rv = noErr; goto done;
     }
     int e = SSL_get_error(s->ssl, ret);
     // mutual TLS + pinning: cert_cb suspended us before sending our cert -> hand the server cert to the app
-    if (e == SSL_ERROR_WANT_X509_LOOKUP) { s->state = 3; rv = ST_PeerAuth; goto done; }
+    if (e == SSL_ERROR_WANT_X509_LOOKUP) { s->state = SH_STATE_PEER_AUTH; rv = ST_PeerAuth; goto done; }
     if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) rv = errSSLWouldBlock;
     else {
         // The OpenSSL reason alongside the SSL_get_error class: the class says only that the
@@ -289,7 +343,8 @@ static OSStatus my_SSLHandshake(SSLContextRef c) {
         unsigned long oe = ERR_peek_last_error();
         if (oe) ERR_error_string_n(oe, why, sizeof why);
         tf_log("handshake FAILED host=%s ssl_err=%d %s", s->host[0] ? s->host : "(none)", e, why);
-        s->state = -1; rv = ST_ClosedAbort;
+        // A server's failures keep errSSLClosedAbort: the table is measured client side only.
+        s->state = SH_STATE_FAILED; rv = s->serverSide ? ST_ClosedAbort : handshake_failure_status(oe);
     }
 done:
     sh_release(s);
@@ -327,7 +382,7 @@ done:
 static OSStatus my_SSLRead(SSLContextRef c, void *data, size_t len, size_t *processed) {
     if (!tf_on()) return o_SSLRead(c, data, len, processed);
     Shadow *s = sh_get(c);
-    if (!s || s->state != 2) { OSStatus r = o_SSLRead(c, data, len, processed); sh_release(s); return r; }
+    if (!s || s->state != SH_STATE_CONNECTED) { OSStatus r = o_SSLRead(c, data, len, processed); sh_release(s); return r; }
     // A read is another entry, so it is another chance for the queue to go out. One attempt,
     // never a wait: the caller's own flush is what this connection depends on, and a read must
     // not hold the thread waiting on a socket in the other direction.
@@ -379,7 +434,7 @@ static OSStatus my_SSLRead(SSLContextRef c, void *data, size_t len, size_t *proc
 static OSStatus my_SSLWrite(SSLContextRef c, const void *data, size_t len, size_t *processed) {
     if (!tf_on()) return o_SSLWrite(c, data, len, processed);
     Shadow *s = sh_get(c);
-    if (!s || s->state != 2) { OSStatus r = o_SSLWrite(c, data, len, processed); sh_release(s); return r; }
+    if (!s || s->state != SH_STATE_CONNECTED) { OSStatus r = o_SSLWrite(c, data, len, processed); sh_release(s); return r; }
     *processed = 0;
     sh_unblock_write(s);
 
@@ -418,7 +473,7 @@ done:
 static OSStatus my_SSLClose(SSLContextRef c) {
     if (!tf_on()) return o_SSLClose(c);
     Shadow *s = sh_get(c);
-    if (s && s->state == 2 && s->ssl) { sh_unblock_write(s); sh_flush_write(s); SSL_shutdown(s->ssl); }
+    if (s && s->state == SH_STATE_CONNECTED && s->ssl) { sh_unblock_write(s); sh_flush_write(s); SSL_shutdown(s->ssl); }
     sh_release(s);
     OSStatus r = o_SSLClose(c);
     sh_free(c);
@@ -426,15 +481,40 @@ static OSStatus my_SSLClose(SSLContextRef c) {
 }
 
 // A context can reach its end without SSLClose -- a connection abandoned before the
-// handshake finishes is disposed, not closed -- and the shadow entry then lives until LRU
-// eviction. In a long-lived, high-churn process (the shared WebKit networking service is
-// the case that matters) those entries accumulate, lengthening every table scan and
-// eventually evicting slots still in use. Freeing here costs nothing when SSLClose already
-// ran: sh_free on a context with no entry is a no-op.
+// handshake finishes is disposed, not closed. Before 10.8 this is the only end a context has,
+// so the entry goes here. From 10.8 my_SSLContextFinalize drops it too, and the second
+// sh_free finds nothing: on a context with no entry it is a no-op.
 static OSStatus my_SSLDisposeContext(SSLContextRef c) {
     if (!tf_on()) return o_SSLDisposeContext(c);
     sh_free(c);
     return o_SSLDisposeContext(c);
+}
+
+// The end every context reaches from 10.8, when a context became a CF object: its destructor,
+// which CF calls on the last release however that release comes -- CFRelease alone,
+// SSLDisposeContext, or the last release after SSLClose (each measured on 10.9.5). Hooked
+// through the class rather than by name; see kFinalizers.
+//
+// SSLClose and SSLDisposeContext alone are not enough. Rust's security-framework, under
+// native-tls, ends every stream dropped without a shutdown with CFRelease alone, and a failed
+// handshake always is. CFNetwork does on some failure paths too. An entry left behind costs
+// twice. The allocator hands the address to a later context, which inherits the dead
+// connection's state: after a failed handshake, state -1, which sends every handshake on it to
+// the native stack. And entries for dead contexts fill the table, until LRU eviction takes the
+// entry of a live one.
+//
+// Not gated on tf_on(): an entry must go with its context whatever the gate says now. The entry
+// goes before the context's memory does, since once the original has run, the address can
+// belong to a new context, on another thread, with an entry of its own.
+static void my_SSLContextFinalize(CFTypeRef c) {
+    // An entry still here means neither SSLClose nor SSLDisposeContext ran: the case this hook
+    // exists for, and otherwise invisible.
+    if (tf_debug()) {
+        Shadow *s = sh_get((SSLContextRef)c);
+        if (s) { tf_log("released without SSLClose  host=%s state=%d", s->host[0] ? s->host : "(none)", s->state); sh_release(s); }
+    }
+    sh_free((SSLContextRef)c);
+    o_SSLContextFinalize(c);
 }
 
 // Answer kSSLHandshake while the engine is handshaking, as the stock stack does from the first
@@ -444,12 +524,23 @@ static OSStatus my_SSLDisposeContext(SSLContextRef c) {
 // The pause for server authentication is where it matters. Rust's security-framework, under
 // native-tls, asks for the state there, and on kSSLIdle returns errSecBadReq instead of fetching
 // the peer trust. tools/statecontract.c measures the stock answers.
+// The public state for each shadow state, or -1 to ask the native context. A new
+// ShadowState without a case here produces a -Wswitch warning.
+static int sh_session_state(ShadowState state) {
+    switch (state) {
+        case SH_STATE_HANDSHAKING: case SH_STATE_PEER_AUTH: return ST_Handshake;
+        case SH_STATE_CONNECTED:                           return ST_Connected;
+        case SH_STATE_NEW: case SH_STATE_FAILED:           return -1;
+    }
+    return -1;
+}
+
 static OSStatus my_SSLGetSessionState(SSLContextRef c, SSLSessionState *st) {
     if (!tf_on()) return o_SSLGetSessionState(c, st);
     Shadow *s = sh_get(c);
+    int answer = s ? sh_session_state(s->state) : -1;
     OSStatus rv;
-    if (s && s->state == 2) { if (st) *st = ST_Connected; rv = noErr; }
-    else if (s && (s->state == 1 || s->state == 3)) { if (st) *st = ST_Handshake; rv = noErr; }
+    if (answer >= 0) { if (st) *st = (SSLSessionState)answer; rv = noErr; }
     else rv = o_SSLGetSessionState(c, st);
     sh_release(s);
     return rv;
@@ -462,7 +553,7 @@ static OSStatus my_SSLGetNegotiatedProtocolVersion(SSLContextRef c, SSLProtocol 
     if (!tf_on()) return o_SSLGetNegotiatedProtocolVersion(c, p);
     Shadow *s = sh_get(c);
     OSStatus rv;
-    if (s && (s->state == 2 || s->state == 3)) {
+    if (s && (s->state == SH_STATE_CONNECTED || s->state == SH_STATE_PEER_AUTH)) {
         rv = p ? s->reportedProtocolStatus : errSecParam;
         if (p) *p = s->reportedProtocol;
     }
@@ -475,7 +566,7 @@ static OSStatus my_SSLGetNegotiatedCipher(SSLContextRef c, SSLCipherSuite *ciphe
     if (!tf_on()) return o_SSLGetNegotiatedCipher(c, cipher);
     Shadow *s = sh_get(c);
     OSStatus rv;
-    if (s && (s->state == 2 || s->state == 3)) {
+    if (s && (s->state == SH_STATE_CONNECTED || s->state == SH_STATE_PEER_AUTH)) {
         rv = cipher ? s->reportedCipherStatus : errSecParam;
         if (cipher) *cipher = s->reportedCipher;
     }
@@ -497,7 +588,7 @@ static OSStatus my_SSLGetBufferedReadSize(SSLContextRef c, size_t *sz) {
     if (!tf_on()) return o_SSLGetBufferedReadSize(c, sz);
     Shadow *s = sh_get(c);
     OSStatus rv;
-    if (s && s->state == 2) {
+    if (s && s->state == SH_STATE_CONNECTED) {
         size_t n = (size_t)SSL_pending(s->ssl);
         if (n == 0 && SSL_has_pending(s->ssl)) n = 1;   // buffered, just not decrypted yet
         if (sz) *sz = n;
@@ -512,7 +603,7 @@ static OSStatus my_SSLCopyPeerTrust(SSLContextRef c, SecTrustRef *trust) {
     if (!tf_on()) return o_SSLCopyPeerTrust(c, trust);
     Shadow *s = sh_get(c);
     OSStatus rv;
-    if (!s || (s->state != 2 && s->state != 3) || !trust) rv = o_SSLCopyPeerTrust(c, trust);
+    if (!s || (s->state != SH_STATE_CONNECTED && s->state != SH_STATE_PEER_AUTH) || !trust) rv = o_SSLCopyPeerTrust(c, trust);
     else if (sh_build_trust(s, trust)) rv = noErr;
     else rv = o_SSLCopyPeerTrust(c, trust);
     sh_release(s);
@@ -523,7 +614,7 @@ static OSStatus my_SSLCopyPeerCertificates(SSLContextRef c, CFArrayRef *certs) {
     if (!tf_on()) return o_SSLCopyPeerCertificates(c, certs);
     Shadow *s = sh_get(c);
     OSStatus rv;
-    if (!s || (s->state != 2 && s->state != 3) || !certs) rv = o_SSLCopyPeerCertificates(c, certs);
+    if (!s || (s->state != SH_STATE_CONNECTED && s->state != SH_STATE_PEER_AUTH) || !certs) rv = o_SSLCopyPeerCertificates(c, certs);
     else { CFArrayRef arr = sh_cert_array(s); if (!arr) rv = o_SSLCopyPeerCertificates(c, certs); else { *certs = arr; rv = noErr; } }
     sh_release(s);
     return rv;
@@ -544,7 +635,7 @@ static OSStatus my_SSLSetCertificate(SSLContextRef c, CFArrayRef certRefs) {
             if (!s->serverSide && tf_flag("disable-mtls")) s->clientBypass = 1;
             else capture_identity(s, certRefs);
         }
-        if (s->inited && s->state != -1) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = 0;
+        if (s->inited && s->state != SH_STATE_FAILED) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = SH_STATE_NEW;
              sh_reset_write(s);
              if (s->trust) { CFRelease(s->trust); s->trust = NULL; } }   // new handshake -> new chain
         sh_release(s);
@@ -600,6 +691,18 @@ static const struct {
 };
 #define NHOOKS (sizeof kHooks / sizeof kHooks[0])
 
+// One row per CF class whose destructor is hooked. A destructor is not an entry point anyone
+// calls by name, so fishhook cannot reach it -- see aquatransport_cfhook.h -- but a row reads
+// like one of kHooks: named by what dlsym resolves, with its replacement and original slot.
+//
+// A row is named by its class's type-ID function, so a class that does not exist on this
+// system leaves its row inert, as an `absent` row in kHooks does. SSLContextGetTypeID arrived
+// in 10.8 along with the CF type; before that, SSLDisposeContext is the only end, and is hooked.
+static const struct cf_rebinding kFinalizers[] = {
+    { "SSLContextGetTypeID", "SSLContext", (void *)my_SSLContextFinalize, (void **)&o_SSLContextFinalize },
+};
+#define NFINALIZERS (sizeof kFinalizers / sizeof kFinalizers[0])
+
 // Resolving the originals is deferred to the first hook call rather than done here, because
 // Secure Transport need not be loaded yet when this runs -- see the note on gating in the
 // header. By the time any of these hooks is entered, the process is calling Secure Transport,
@@ -620,7 +723,11 @@ static void resolve_origs(void) {
     for (size_t i = 0; i < NHOOKS; i++) {
         void *real = dlsym(RTLD_DEFAULT, kHooks[i].name);
         if (!real) {
-            if (kHooks[i].absent) { *(kHooks[i].orig) = kHooks[i].absent; continue; }
+            if (kHooks[i].absent) {
+                tf_log("%s absent on this system; its hook is inert", kHooks[i].name);
+                *(kHooks[i].orig) = kHooks[i].absent;
+                continue;
+            }
             tf_log("could not resolve %s", kHooks[i].name);
             *(kHooks[i].orig) = (void *)st_unavailable;
             ok = 0;
@@ -629,6 +736,11 @@ static void resolve_origs(void) {
         *(kHooks[i].orig) = real;
     }
     g_origs_ok = ok;
+    tf_log(ok ? "Secure Transport resolved" : "Secure Transport incomplete; the engine stays off");
+    // Here, with the originals, rather than in install_ssl_hooks: a destructor is reached
+    // through its class, which exists only once Secure Transport is loaded. This is the first
+    // point at which it is known to be, and it comes before any context this library sees.
+    rebind_cf_finalizers(kFinalizers, NFINALIZERS);
 }
 
 // True once the original entry points are available. A hook may run its own logic only when
