@@ -1670,7 +1670,7 @@
 				<key>USE_HFS+_COMPRESSION</key>
 				<false/>
 				<key>VERSION</key>
-				<string>2026.09.03</string>
+				<string>2026.10.21</string>
 			</dict>
 			<key>TYPE</key>
 			<integer>0</integer>
@@ -1782,12 +1782,14 @@
 										<key>LANGUAGE</key>
 										<string>English</string>
 										<key>VALUE</key>
-										<string>Adds a set of contemporary root certificates to the system keychain which are frequently needed to access the modern web. Also distrusts a set of old certificates which are widely considered unsafe. If unsure, leave this enabled.
+										<string>Adds contemporary root certificates to the system keychain which are frequently needed to access modern websites. Also distrusts old certificates that are considered unsafe. A list of certificates is below. If unsure, leave this enabled.
 
 New Certificates:
-• Amazon Root CA 1• Amazon Root CA 3• DigiCert Global Root G2• DigiCert Global Root G3• GlobalSign Root R46• GTS Root R1• GTS Root R4• HARICA TLS RSA Root CA 2021• ISRG Root X1• ISRG Root X2• Sectigo Public Server Authentication Root R46• SSL.com EV Root Certification Authority RSA R2• USERTrust ECC Certification Authority• USERTrust RSA Certification Authority
+• Amazon Root CA 1• Amazon Root CA 3• DigiCert Global Root G2• DigiCert Global Root G3
+• GlobalSign R6• GlobalSign Root R46• GTS Root R1• GTS Root R4• HARICA TLS RSA Root CA 2021• ISRG Root X1• ISRG Root X2• Sectigo Public Server Authentication Root R46• SSL.com EV Root Certification Authority RSA R2• USERTrust ECC Certification Authority• USERTrust RSA Certification Authority
 
-Distrusted Certificates:• Chambers of Commerce Root
+Distrusted Certificates:
+• AAA Certificate Services• Chambers of Commerce Root
 • Chambers of Commerce Root - 2008• Global Chambersign Root
 • Global Chambersign Root - 2008• StartCom Certification Authority (SHA-1)• StartCom Certification Authority (SHA-256)• StartCom Certification Authority G2</string>
 									</dict>
