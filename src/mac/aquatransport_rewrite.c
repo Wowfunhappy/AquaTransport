@@ -482,9 +482,8 @@ CFURLRef WKExternalURLRewrite(CFURLRef url, CFMutableDictionaryRef headers) {
 // and i386 passing more arguments than the callee reads is harmless, whereas declaring
 // fewer than the real count would make the callee read uninitialised registers or stack.
 // This keeps the pass-through safe without depending on private headers being exact.
-void tf_rewrite_install(void) {
-    tf_maps_install();
-    struct rebinding r[] = {
+struct tf_hook_group tf_rewrite_hooks(void) {
+    static const struct rebinding r[] = {
         { "CFURLRequestCreateMutableCopy",         (void *)my_MutableCopy,     (void **)&o_MutableCopy, tf_cfnetwork_providers },
         { "CFURLConnectionSendSynchronousRequest", (void *)my_SendSync,        (void **)&o_SendSync, tf_cfnetwork_providers },
         { "CFURLConnectionCreateWithProperties",   (void *)my_CreateWithProps, (void **)&o_CreateWithProps, tf_cfnetwork_providers },
@@ -492,6 +491,5 @@ void tf_rewrite_install(void) {
         { "CFHTTPMessageCreateRequest",            (void *)my_MsgCreate,       (void **)&o_MsgCreate, tf_cfnetwork_providers },
         { "CFHTTPMessageSetHeaderFieldValue",      (void *)my_MsgSetHeader,    (void **)&o_MsgSetHeader, tf_cfnetwork_providers },
     };
-    // Also arms a dyld add-image callback, so CFNetwork loaded later still gets rebound.
-    rebind_symbols(r, sizeof r / sizeof r[0]);
+    return (struct tf_hook_group){ r, sizeof r / sizeof r[0] };
 }

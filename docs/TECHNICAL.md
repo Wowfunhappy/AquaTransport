@@ -221,9 +221,9 @@ nothing else on the Mac is affected. The shipped default lists
 does its network I/O in `com.apple.WebKit.Networking` — a separate process that still gets the
 engine.
 
-This is a different mechanism from the `kDeny[]` list in `aquatransport_hooks_mac.c`, which
-names the trust daemons whose own traffic would otherwise route through our verify path and
-make trust evaluation depend on trust evaluation. That list is structural and not user-editable.
+The `kTrustServices[]` list in `aquatransport_hooks_mac.c` selects TLS-only installation
+for trust daemons. It does not exclude them from modern TLS; `disabled.txt` is the
+explicit exclusion mechanism.
 
 ### Flags
 
@@ -278,6 +278,12 @@ progress never sees a partially written file.
 ## How the hooks are installed
 
 Both subsystems rebind symbol pointers with the vendored fishhook (`deps/fishhook/`).
+The engine collects its TLS, URL-rewrite, trust and eligible Maps/AirDrop hooks into
+one registration, so existing images are scanned once. Trust services collect only
+the TLS group, and excluded processes register nothing. The separately loaded
+AirDrop adapter also registers its hooks in one batch. Fishhook retains each batch
+for images loaded later; provider matching and original-function lookup are unchanged.
+
 Every registration requires a symbol name **and an explicit list of import providers**.
 For example, `SSLRead` is hooked only when its import names Security.framework; an
 application's import of `SSLRead` from its own library is left untouched.
@@ -332,9 +338,10 @@ lookup exclusions, and provider-scoped original lookup. With an engine path, it 
 checks that unrelated `SSLRead` and CFNetwork imports survive, and that real system
 calls still work when the executable exports conflicting original-function names.
 
-`install_ssl_hooks()` decides per process whether to install anything, so a process on the
-trust-daemon deny list carries no hooks at all. The per-hook `tf_on()` gate still runs on
-every call: `tf_reentrant()` is dynamic and cannot be decided at install time.
+The constructor honors `disabled.txt` before installing hooks. Trust services receive
+the TLS hooks but no application URL rewriting or optional features. The per-hook
+`tf_on()` gate resolves original entry points and checks process eligibility; being
+inside a trust evaluation does not select the native TLS transport.
 
 ### Destructors: what fishhook cannot reach
 
@@ -518,16 +525,38 @@ pointer parameters against real arities of four: passing more arguments than the
 reads is harmless on both x86_64 and i386, while declaring fewer would make it read
 uninitialised registers.
 
-### The one list that remains, and why
+### TLS for trust-service downloads
 
-`ocspd`, `securityd`, `securityd_service`, `trustd` are excluded from the engine. That is
-not "things that happen to break" — it is a circular dependency: our verify path calls
-`SecTrustEvaluate`, which those processes *implement*. A re-entrancy guard
-(`tf_guard_enter`/`tf_reentrant`, pthread-specific rather than `__thread` for 10.6)
-handles the same-thread case; these four are where the cycle crosses a process boundary.
+`ocspd`, `securityd`, `securityd_service`, and `trustd` receive TLS hooks, while
+application URL rewriting and optional features stay disabled in those processes.
+This allows HTTPS certificate and revocation downloads to negotiate modern TLS.
+`disabled.txt` still excludes any named process from all hooks.
 
-Anything else misbehaving with the library loaded is a bug in the engine to fix, not a name to
-add.
+The former native-TLS bypass did not remove the dependency on trust evaluation:
+Apple's own `sslVerifyCertChain` also invokes `SecTrustEvaluate`. AquaTransport
+retains native trust policy, including AIA chasing and revocation behavior, while
+replacing the TLS transport. It does not accept an untrusted HTTPS endpoint to
+make a download succeed.
+
+The thread-local trust guard is a nesting counter. It prevents the optional
+anchor-policy hook from changing AquaTransport's own trust evaluations, but does
+not prevent a nested HTTPS connection from using OpenSSL. Errors from nested
+OpenSSL operations are discarded when returning from native trust evaluation so
+they do not contaminate the outer handshake's error reporting.
+
+`bash tools/test-trust-transport.sh` checks TLS-1.3-only socketpair peers on i386
+and x86_64, using each trust-service process name and an ordinary application
+name. It covers a connection started inside another connection's trust evaluation,
+native and application-directed verification, rejection of wrong-host and untrusted
+certificates, and the `disabled.txt` exclusion. Anchors are attached only to test
+trust objects; no certificate is installed. The test requires access to the local
+Security services and has been run on 10.9.5; it does not launch or replace the
+real daemons, or establish compatibility on 10.6–10.8.
+
+Modern TLS does not validate a downloaded certificate file as ASN.1. AIA response
+bodies, including HTTP responses and CMS certificate bundles, need their own
+validation before native parsing. This transport change does not fix
+CVE-2021-30737 or claim to provide that response validation.
 
 ## Client certificates the security level would refuse
 

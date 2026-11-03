@@ -7,6 +7,18 @@
 
 #include "../../deps/fishhook/fishhook.h"
 
+// Collect static tables before registering them together in the engine constructor.
+// Optional groups are empty when their platform/process/feature gate is closed.
+struct tf_hook_group {
+    const struct rebinding *bindings;
+    size_t count;
+};
+
+struct tf_hook_group tf_rewrite_hooks(void);
+struct tf_hook_group tf_trust_hooks(void);
+struct tf_hook_group tf_maps_hooks(void);
+struct tf_hook_group tf_airdrop_hooks(void);
+
 #define TF_PROVIDERS(name, ...) \
     static const char *const name[] __attribute__((unused)) = { __VA_ARGS__, NULL }
 

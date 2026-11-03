@@ -13,10 +13,8 @@
 //      Secure Transport imports. Measured on 10.6.8 and 10.9.5, i386 and x86_64: an image
 //      loaded at that point still rebinds CFNetwork's calls into Secure Transport, after
 //      those symbols have already been bound and used.
-//   3. install_ssl_hooks() decides per process whether to install anything, so a process on
-//      the trust-daemon deny list carries no hooks at all. The per-hook tf_on() gate still
-//      runs on every call, because tf_reentrant() is dynamic and cannot be decided at install
-//      time.
+//   3. disabled.txt excludes a process from all hooks. Trust services get the TLS hooks
+//      without the application's URL rewriting or other optional features.
 //
 // One hook is not fishhook's: a context's destructor, which no image calls by name. It is
 // replaced in the class record CoreFoundation calls it through, by rebind_cf_finalizers, from
@@ -40,6 +38,7 @@
 #include "aquatransport_config.h"
 #include "aquatransport_gsa_mail.h"
 #include "aquatransport_symbols.h"
+#include "aquatransport_maps.h"
 #include <openssl/err.h>
 #include <pthread.h>
 #include <string.h>
@@ -50,32 +49,27 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include "aquatransport_cfhook.h"
-// The trust infrastructure itself. This is not a list of things that happen to break --
-// it is a circular dependency: our verify path calls SecTrustEvaluate, which these
-// processes implement. Routing their own traffic through that check would make trust
-// evaluation depend on trust evaluation. tf_reentrant() in the engine guards the
-// same-thread case; these are the processes where the cycle spans a process boundary.
-//
-// Nothing else is listed. If any other process misbehaves with the library loaded, that is a
-// bug in the engine to fix, not a name to add here.
-static const char *kDeny[] = {
+// Trust services need modern TLS for HTTPS issuer/revocation downloads too. Native
+// Secure Transport also calls SecTrustEvaluate; handing their TLS back to it does
+// not remove a trust dependency, it only limits the available protocols/ciphers.
+// Keep application URL rewriting and optional features out of these processes.
+static const char *kTrustServices[] = {
     "ocspd", "securityd", "securityd_service", "trustd", 0
 };
 
-// Whether this process may be touched at all: every process except the trust daemons on the
-// deny list, whose own traffic routing through our verify path would be a cycle, and any
-// process the user has named in disabled.txt.
-//
-// The file is a separate mechanism from kDeny above, not an extension of it. kDeny encodes a
-// structural cycle in our own design. The file exists because a process can host third-party
-// code we have no say over, which is entitled to object to having its imports rebound
-// underneath it -- a DRM module that verifies its own address space, say. Handing the user a
-// name to exclude is the honest answer there; the alternative is that such a process simply
-// cannot run on a machine with this library installed.
+static int trust_service(void) {
+    const char *pn = getprogname();
+    if (pn)
+        for (int i = 0; kTrustServices[i]; i++)
+            if (!strcmp(pn, kTrustServices[i])) return 1;
+    return 0;
+}
+
+// disabled.txt remains an escape hatch from all runtime modifications, including
+// for processes hosting code which objects to having its imports rebound.
 static int process_eligible(void) {
     const char *pn = getprogname();
     if (!pn) return 1;
-    for (int i = 0; kDeny[i]; i++) if (!strcmp(pn, kDeny[i])) return 0;
     if (tf_name_listed("disabled.txt", pn)) return 0;
     return 1;
 }
@@ -88,16 +82,16 @@ static int origs_ready(void);
 static void gate_init(void) { g_on = process_eligible(); }
 
 // Runtime gate. Lazily evaluated rather than set from the constructor because another
-// inserted library's initialiser could reach a hook before ours has run. Also off while
-// we are inside our own Security calls, so a revocation fetch triggered by our trust
-// evaluation goes out over the system stack instead of recursing into us.
+// inserted library's initialiser could reach a hook before ours has run. A connection
+// opened by a trust evaluation uses the same modern TLS transport as any other
+// connection. The trust guard controls trust-policy hooks, not transport selection.
 // Also the point at which the original entry points are resolved, which is why every hook
 // calls it before touching an o_* pointer: the hooks are installed unconditionally, possibly
 // long before Security.framework is loaded, so resolution cannot happen at install time.
 static inline int tf_on(void) {
     pthread_once(&g_gate, gate_init);
     if (!origs_ready()) return 0;      // fall through to the stub, which reports an error
-    return g_on && !tf_reentrant();
+    return g_on;
 }
 
 // The real Secure Transport entry points. Resolved at first use; see the header
@@ -127,16 +121,6 @@ static OSStatus (*o_SSLSetCertificate)(SSLContextRef, CFArrayRef);
 static void (*o_SSLContextFinalize)(CFTypeRef);
 
 #include "aquatransport_reporting.inc"
-
-// Installs the URL rewriter's CFNetwork hooks. Pure C -- see src/mac/aquatransport_rewrite.c for
-// why it rebinds CFNetwork's C API by name. Safe in every process and installed unconditionally:
-// nothing is loaded, no framework is pulled in, and processes that never touch CFNetwork simply
-// have nothing to rebind.
-extern void tf_rewrite_install(void);
-
-// Installs the certificate-trust hook. See src/mac/aquatransport_trust_mac.c. Installed under
-// the same eligibility gate as the rest, so denied processes never carry it.
-extern void tf_trust_install(void);
 
 // Which side of the handshake a context speaks is settled when it is created and never named
 // again: Secure Transport on 10.6-10.9 exports no way to ask a context afterwards. So the two
@@ -736,7 +720,7 @@ static void resolve_origs(void) {
     }
     g_origs_ok = ok;
     tf_log(ok ? "Secure Transport resolved" : "Secure Transport incomplete; the engine stays off");
-    // Here, with the originals, rather than in install_ssl_hooks: a destructor is reached
+    // Here, with the originals, rather than in install_hooks: a destructor is reached
     // through its class, which exists only once Secure Transport is loaded. This is the first
     // point at which it is known to be, and it comes before any context this library sees.
     rebind_cf_finalizers(kFinalizers, NFINALIZERS);
@@ -749,14 +733,32 @@ static int origs_ready(void) {
     return g_origs_ok;
 }
 
-static void install_ssl_hooks(void) {
-    struct rebinding r[NHOOKS];
+static void install_hooks(int tls_only) {
+    struct rebinding ssl[NHOOKS];
 
     for (size_t i = 0; i < NHOOKS; i++) {
-        r[i].name        = kHooks[i].name;
-        r[i].replacement = kHooks[i].repl;
-        r[i].replaced    = NULL;   // see header comment: fishhook's value is not the function
-        r[i].providers   = tf_security_providers;
+        ssl[i].name        = kHooks[i].name;
+        ssl[i].replacement = kHooks[i].repl;
+        ssl[i].replaced    = NULL;   // see header comment: fishhook's value is not the function
+        ssl[i].providers   = tf_security_providers;
+    }
+
+    struct tf_hook_group groups[] = { { ssl, NHOOKS }, {0}, {0}, {0}, {0} };
+    if (!tls_only) {
+        groups[1] = tf_airdrop_hooks();
+        groups[2] = tf_maps_hooks();
+        groups[3] = tf_rewrite_hooks();
+        groups[4] = tf_trust_hooks();
+    }
+    size_t count = 0;
+    for (size_t i = 0; i < sizeof groups / sizeof groups[0]; i++) count += groups[i].count;
+    struct rebinding bindings[count];
+    size_t offset = 0;
+    // Fishhook searches the first match. Keep the former later-registration precedence.
+    for (size_t i = sizeof groups / sizeof groups[0]; i-- > 0;) {
+        if (!groups[i].count) continue;
+        memcpy(bindings + offset, groups[i].bindings, groups[i].count * sizeof bindings[0]);
+        offset += groups[i].count;
     }
 
     // Matching name + import ordinal needs no symbol resolution: unrelated SSLRead
@@ -764,7 +766,15 @@ static void install_ssl_hooks(void) {
     // framework that arrives later -- including Security.framework itself -- gets rebound the
     // moment it is loaded. That is what makes installing unconditionally here correct, and it
     // is an event, not a wait: nothing anywhere has to predict when Security will show up.
-    rebind_symbols(r, NHOOKS);
+    // One registration scans existing images once and retains all groups for late loads.
+    if (rebind_symbols(bindings, count)) {
+        tf_log("could not register hooks");
+        return;
+    }
+    if (!tls_only) {
+        tf_airdrop_install();
+        tf_maps_install();
+    }
 }
 
 __attribute__((constructor))
@@ -780,8 +790,5 @@ static void aquatransport_init(void) {
     // Transport is loaded, so gating installation on it would mean never installing in a
     // process that loads Security later. Rebinding a symbol no loaded image imports is a
     // no-op, and fishhook rebinds the call sites when the framework does arrive.
-    install_ssl_hooks();
-    tf_airdrop_install();
-    tf_rewrite_install();
-    tf_trust_install();
+    install_hooks(trust_service());
 }

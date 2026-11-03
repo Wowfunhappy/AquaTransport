@@ -288,13 +288,11 @@ __attribute__((constructor)) static void install_airdrop(void) { @autoreleasepoo
         {"CFNetServiceSetTXTData",(void *)&set_txt,NULL,tf_cfnetwork_providers},
         {"_CFHTTPServerResponseCreateWithData",(void *)&response,NULL,tf_cfnetwork_providers},
         {"connect",(void *)&scoped_connect,NULL,tf_socket_providers},
-        {"connectx",(void *)&scoped_connectx,NULL,tf_socket_providers}
+        {"connectx",(void *)&scoped_connectx,NULL,tf_socket_providers},
+        {"CFURLConnectionCreateWithProperties",(void *)&create_connection,NULL,tf_cfnetwork_providers},
+        {"BOMCopierCopyWithOptions",(void *)&incoming_bom_copy,NULL,tf_bom_providers}
     };
     if(rebind_symbols(hooks,sizeof(hooks)/sizeof(hooks[0]))) return;
-    struct rebinding outgoing={"CFURLConnectionCreateWithProperties",(void *)&create_connection,NULL,tf_cfnetwork_providers};
-    if(rebind_symbols(&outgoing,1)) return;
-    struct rebinding incoming={"BOMCopierCopyWithOptions",(void *)&incoming_bom_copy,NULL,tf_bom_providers};
-    if(rebind_symbols(&incoming,1)) return;
     original_zipper_copy=(void *)method_setImplementation(zipper_copy,(IMP)incoming_copy);
     original_publication_callback=(void *)method_setImplementation(publication,(IMP)publication_callback);
     original_publication_stop=(void *)method_setImplementation(publication_end,(IMP)publication_stop);

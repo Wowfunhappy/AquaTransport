@@ -101,7 +101,18 @@ static void air_drop_cache_limit(int connection_type,int limit) {
     pthread_once(&load_once,load_adapter);
     native_cache_limit(connection_type,limit);
 }
+struct tf_hook_group tf_airdrop_hooks(void) {
+    struct utsname os; char executable[1024]; uint32_t size=sizeof(executable);
+    if(uname(&os) || _NSGetExecutablePath(executable,&size) ||
+       !aq_airdrop_platform_supported((unsigned)atoi(os.release),sizeof(void *),executable,tap_available()) ||
+       tf_flag("disable-modern-airdrop")) return (struct tf_hook_group){ NULL, 0 };
+    native_cache_limit=fishhook_resolve(tf_cfnetwork_providers,"_CFNetworkHTTPConnectionCacheSetLimit");
+    if(!native_cache_limit) return (struct tf_hook_group){ NULL, 0 };
+    static const struct rebinding hook={"_CFNetworkHTTPConnectionCacheSetLimit",(void *)&air_drop_cache_limit,NULL,tf_cfnetwork_providers};
+    return (struct tf_hook_group){ &hook, 1 };
+}
 void tf_airdrop_install(void) {
+    // Arm UI loading only after the engine's hooks have been installed.
     struct utsname os; char executable[1024]; uint32_t size=sizeof(executable);
     if(uname(&os) || _NSGetExecutablePath(executable,&size)) return;
     if(atoi(os.release)==13 && sizeof(void *)==8 && tap_available() && !tf_flag("disable-modern-airdrop")) {
@@ -109,10 +120,4 @@ void tf_airdrop_install(void) {
             dispatch_async_f(dispatch_get_main_queue(),NULL,load_ui_adapter);
         else _dyld_register_func_for_add_image(air_drop_ui_image_added);
     }
-    if(
-       !aq_airdrop_platform_supported((unsigned)atoi(os.release),sizeof(void *),executable,tap_available()) || tf_flag("disable-modern-airdrop")) return;
-    native_cache_limit=fishhook_resolve(tf_cfnetwork_providers,"_CFNetworkHTTPConnectionCacheSetLimit");
-    if(!native_cache_limit) return;
-    struct rebinding hook={"_CFNetworkHTTPConnectionCacheSetLimit",(void *)&air_drop_cache_limit,NULL,tf_cfnetwork_providers};
-    rebind_symbols(&hook,1);
 }

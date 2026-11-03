@@ -62,15 +62,14 @@ static OSStatus my_SecTrustSetAnchorCertificates(SecTrustRef trust, CFArrayRef a
     return r;
 }
 
-// Rebinds SecTrustSetAnchorCertificates. Called from the constructor after the process is
+// Collects SecTrustSetAnchorCertificates. Called from the constructor after the process is
 // found eligible, so denied processes never carry this hook. Rebinding needs nothing loaded:
 // a process that never reaches Security has no call site to rewrite, and fishhook's add-image
 // callback rebinds Security whenever it arrives.
-void tf_trust_install(void) {
-    struct rebinding r[1];
-    r[0].name        = "SecTrustSetAnchorCertificates";
-    r[0].replacement = (void *)my_SecTrustSetAnchorCertificates;
-    r[0].replaced    = NULL;
-    r[0].providers   = tf_security_providers;
-    rebind_symbols(r, 1);
+struct tf_hook_group tf_trust_hooks(void) {
+    static const struct rebinding r[] = {
+        { "SecTrustSetAnchorCertificates", (void *)my_SecTrustSetAnchorCertificates,
+          NULL, tf_security_providers }
+    };
+    return (struct tf_hook_group){ r, sizeof r / sizeof r[0] };
 }

@@ -93,11 +93,10 @@ typedef struct {
     size_t           wpendLen;
 } Shadow;
 
-// Re-entrancy guard. Our verify path calls into Security, which may itself open a
-// connection (revocation checks); without this, that nested connection would come back
-// through our hooks and call Security again. Set around our own Security calls; hooks
-// fall through to the system stack while it is set. pthread_specific rather than __thread
-// because native TLS needs a 10.7+ deployment target.
+// Nestable, thread-local guard for our own trust operations. Trust-policy hooks
+// leave these evaluations alone; TLS transport remains available to connections
+// opened during evaluation. pthread_specific rather than __thread because native
+// thread-local storage needs a 10.7+ deployment target.
 void       tf_guard_enter(void);
 void       tf_guard_leave(void);
 int        tf_reentrant(void);

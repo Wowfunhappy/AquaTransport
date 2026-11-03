@@ -101,14 +101,19 @@ static void *maps_dlopen(const char *path, int flags) {
     if (image && __sync_fetch_and_add(&geo_seen,0)) try_eta();
     return image;
 }
-void tf_maps_install(void) {
+struct tf_hook_group tf_maps_hooks(void) {
     if (maps_supported() && !tf_flag("disable-maps-fixes")) {
         native_dlopen=fishhook_resolve(tf_dlopen_providers,"dlopen");
-        if (!native_dlopen) return;
-        struct rebinding hook={"dlopen", (void *)&maps_dlopen, NULL, tf_dlopen_providers};
-        rebind_symbols(&hook,1);
-        _dyld_register_func_for_add_image(maps_image);
+        if (native_dlopen) {
+            static const struct rebinding hook={"dlopen", (void *)&maps_dlopen, NULL, tf_dlopen_providers};
+            return (struct tf_hook_group){ &hook, 1 };
+        }
     }
+    return (struct tf_hook_group){ NULL, 0 };
+}
+void tf_maps_install(void) {
+    // Called after the engine's batch has installed the dlopen hook.
+    if (native_dlopen) _dyld_register_func_for_add_image(maps_image);
 }
 char *tf_maps_rewrite_url(const char *url) {
     /* A narrow C prefilter keeps Objective-C out of unrelated URL requests. */
