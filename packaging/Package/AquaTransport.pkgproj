@@ -1789,7 +1789,13 @@ New Certificates:
 • GlobalSign R6• GlobalSign Root R46• GTS Root R1• GTS Root R4• HARICA TLS RSA Root CA 2021• ISRG Root X1• ISRG Root X2• Sectigo Public Server Authentication Root R46• SSL.com EV Root Certification Authority RSA R2• USERTrust ECC Certification Authority• USERTrust RSA Certification Authority
 
 Distrusted Certificates:
-• AAA Certificate Services• Chambers of Commerce Root
+• EM DV TLS CA - G3B (AAA cross-signed)
+• EM DV TLS CA - G3C (AAA cross-signed)
+• EM EV TLS CA - G3B (AAA cross-signed)
+• EM EV TLS CA - G3C (AAA cross-signed)
+• EM OV TLS CA - G3B (AAA cross-signed)
+• EM OV TLS CA - G3C (AAA cross-signed)
+• Chambers of Commerce Root
 • Chambers of Commerce Root - 2008• Global Chambersign Root
 • Global Chambersign Root - 2008• StartCom Certification Authority (SHA-1)• StartCom Certification Authority (SHA-256)• StartCom Certification Authority G2</string>
 									</dict>
