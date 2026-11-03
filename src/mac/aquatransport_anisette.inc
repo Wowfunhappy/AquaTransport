@@ -10,6 +10,7 @@
 
 static struct {
     int (*otp)(uint64_t, void **, uint32_t *, void **, uint32_t *);
+    int (*sync)(uint64_t, const void *, uint32_t, void **, uint32_t *, void **, uint32_t *);
     int (*start)(uint64_t, const void *, uint32_t, void **, uint32_t *, uint32_t *);
     int (*finish)(uint32_t, const void *, uint32_t, const void *, uint32_t);
     int (*destroy)(uint32_t);
@@ -84,6 +85,7 @@ static BOOL aq_adi_load(void) {
     [NSClassFromString(@"AOSUtilities") class];
     if (!AQADI.otp) {
         AQADI.otp = aq_adi_symbol("_qi864985u0");
+        AQADI.sync = aq_adi_symbol("_tn46gtiuhw");
         AQADI.start = aq_adi_symbol("_rsegvyrt87");
         AQADI.finish = aq_adi_symbol("_uv5t6nhkui");
         AQADI.destroy = aq_adi_symbol("_fy34trz2st");
@@ -223,17 +225,75 @@ static NSDictionary *aq_adi_headers(AQGSAProtocol *owner, NSString *device, int 
     } @finally { if (machine) AQADI.dispose(machine); if (otp) AQADI.dispose(otp); }
 }
 
+/* Turn Apple's Server Intermediate Message into the MID/SRM pair expected by
+ * midSyncMachine. The named wrapper is the same one Mavericks AOSKit uses for
+ * its native md-sync-machine recovery path. It updates only Apple's local ADI
+ * state; the caller sends the resulting values back to Apple. */
+static NSDictionary *aq_adi_synchronize(NSData *server, NSString *device, int fd, NSError **error) {
+    if (!AQADI.sync) { *error = aq_error(10, @"This Apple framework does not expose native device resynchronization."); return nil; }
+    if (![server length] || [server length] > 1024*1024) { *error = aq_error(28, @"Apple returned invalid device synchronization data."); return nil; }
+    NSMutableDictionary *record = aq_adi_read(fd);
+    if (![[record objectForKey:@"device"] isEqual:device] || !aq_adi_routing([record objectForKey:@"routing"])) {
+        *error = aq_error(18, @"This device is provisioned but its Apple routing record is missing. Existing native state has been preserved."); return nil;
+    }
+    if (AQADI.state((uint64_t)-2)) { *error = aq_error(12, @"Native device provisioning state is unavailable."); return nil; }
+    void *mid = NULL, *srm = NULL; uint32_t ml = 0, sl = 0;
+    int status = AQADI.sync((uint64_t)-2, [server bytes], (uint32_t)[server length], &mid, &ml, &srm, &sl);
+    @try {
+        if (status || !mid || !srm || !ml || !sl || ml > 16384 || sl > 16384) {
+            *error = aq_error(29, @"Native device resynchronization returned no usable response."); return nil;
+        }
+        return [NSDictionary dictionaryWithObjectsAndKeys:
+            [NSData dataWithBytes:mid length:ml], @"mid", [NSData dataWithBytes:srm length:sl], @"srm", nil];
+    } @finally { if (mid) AQADI.dispose(mid); if (srm) AQADI.dispose(srm); }
+}
+
+static BOOL aq_adi_store_routing(NSString *routing, NSString *device, int fd, NSError **error) {
+    routing = aq_adi_routing(routing);
+    NSMutableDictionary *record = aq_adi_read(fd);
+    if (!routing || ![[record objectForKey:@"device"] isEqual:device] ||
+        !aq_adi_routing([record objectForKey:@"routing"]) || AQADI.state((uint64_t)-2)) {
+        *error = aq_error(28, @"Apple returned invalid device routing information."); return NO;
+    }
+    [record setObject:routing forKey:@"routing"];
+    if (!aq_adi_save(fd, record)) { *error = aq_error(14, @"Could not save Apple's device routing information."); return NO; }
+    return YES;
+}
+
 @interface AQNativeAnisetteGenerator : NSObject
 + (NSDictionary *)headersForOwner:(AQGSAProtocol *)owner error:(NSError **)error;
++ (NSDictionary *)synchronizeServerData:(NSData *)server owner:(AQGSAProtocol *)owner error:(NSError **)error;
++ (BOOL)storeRouting:(NSString *)routing owner:(AQGSAProtocol *)owner error:(NSError **)error;
 @end
 @implementation AQNativeAnisetteGenerator
 + (NSDictionary *)headersForOwner:(AQGSAProtocol *)owner error:(NSError **)error {
     @synchronized(self) {
         if (!aq_adi_load()) { *error = aq_error(10, @"This Apple framework does not expose the required native device authentication routines."); return nil; }
+        if (!aq_client_info()) { *error = aq_error(13, @"This Mac has no usable model or system version."); return nil; }
         NSString *device = aq_device_field(aq_device_uuid());
         if (!device) { *error = aq_error(13, @"This Mac has no hardware UUID."); return nil; }
         int fd = aq_adi_lock(error); if (fd < 0) return nil;
         @try { return aq_adi_headers(owner, device, fd, error); }
+        @finally { flock(fd, LOCK_UN); close(fd); }
+    }
+}
++ (NSDictionary *)synchronizeServerData:(NSData *)server owner:(AQGSAProtocol *)owner error:(NSError **)error {
+    @synchronized(self) {
+        if (!aq_adi_load()) { *error = aq_error(10, @"This Apple framework does not expose the required native device authentication routines."); return nil; }
+        NSString *device = aq_device_field(aq_device_uuid());
+        if (!device) { *error = aq_error(13, @"This Mac has no hardware UUID."); return nil; }
+        int fd = aq_adi_lock(error); if (fd < 0) return nil;
+        @try { return aq_adi_synchronize(server, device, fd, error); }
+        @finally { flock(fd, LOCK_UN); close(fd); }
+    }
+}
++ (BOOL)storeRouting:(NSString *)routing owner:(AQGSAProtocol *)owner error:(NSError **)error {
+    @synchronized(self) {
+        if (!aq_adi_load()) { *error = aq_error(10, @"This Apple framework does not expose the required native device authentication routines."); return NO; }
+        NSString *device = aq_device_field(aq_device_uuid());
+        if (!device) { *error = aq_error(13, @"This Mac has no hardware UUID."); return NO; }
+        int fd = aq_adi_lock(error); if (fd < 0) return NO;
+        @try { return aq_adi_store_routing(routing, device, fd, error); }
         @finally { flock(fd, LOCK_UN); close(fd); }
     }
 }

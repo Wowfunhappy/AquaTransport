@@ -38,6 +38,16 @@ implementation. All 108 offline checks pass, including ordinary and native AOSKi
 refreshes on i386, x86_64 and x86_64 GC. Preference-pane completion still requires
 user confirmation.
 
+**Device-resynchronization fix (adapter 12, 2026-11-03):** GrandSlam can return
+HTTP 200 with `hsc 434`, `ec -22421` and `X-Apple-I-MD-DATA` when a previously
+provisioned machine must refresh its device state. Earlier builds treated that
+response as a terminal authentication failure. The adapter now passes the server
+message to the Mac's own CoreADI `Synchronize` wrapper, posts the resulting MID/SRM
+pair to Apple's URL-bag `midSyncMachine` endpoint, obtains fresh device headers and
+retries the interrupted GrandSlam operation once. A repeated challenge, malformed
+server message, native failure, invalid URL, rejected sync or routing persistence
+failure stops without another retry. No account credential enters this repair path.
+
 ## Build
 
 The module needs a compiler that supports Objective-C garbage collection. Mavericks
@@ -95,8 +105,10 @@ All clients use `/var/run/org.aquatransport.anisette.sock`. Clients verify the
 server's root identity. The broker obtains each client's user ID from the kernel
 and starts a fresh worker with that user's groups, UID and home directory;
 only the worker calls Apple's native generator. Workers verify the peer again.
-The socket accepts only a request for device headers; account names,
-passwords, verification codes and service tokens never pass through it. There is
+The socket accepts requests to generate device headers, transform an Apple-issued
+resynchronization message with CoreADI, and persist routing returned by that same
+exchange. Account names, passwords, verification codes and service tokens never
+pass through it. Resynchronization input and output are bounded. There is
 no TCP listener, remote provider, provider URL setting, downloaded runtime, or
 alternate generation path. Failure stops authentication.
 
@@ -144,11 +156,13 @@ closed; native compatibility has been tested on 10.9.5, not 10.7 or 10.8.
 Native `X-Apple-MD` and `X-Apple-MD-M` become
 `X-Apple-I-MD` and `X-Apple-I-MD-M`; missing, empty, malformed or oversized values
 are rejected. The local identity is the base64-encoded hardware UUID, routing
-information comes from Apple's successful provisioning response, and client information
-is `<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>`.
+information comes from Apple's successful provisioning response. Client information
+uses the Mac's real `hw.model`, installed OS version and build, followed by the
+GrandSlam-compatible `com.apple.AuthKit/1 (com.apple.akd/1.0)` application token.
 The adapter adds current time, timezone and locale and forwards no other native
-dictionary fields. Once provisioned, generation makes no HTTP requests. Account proofs, verification
-codes, service tokens and generated device headers go directly to Apple.
+dictionary fields. Once provisioned, header generation and the native half of
+resynchronization make no HTTP requests. Account proofs, verification codes,
+service tokens and generated device headers go directly to Apple.
 
 ### V3 and native generation
 
@@ -191,6 +205,23 @@ record a value retained from a successful provisioning response, provided native
 state exists and no routing record is already present. It cannot discover or
 guess a lost routing value and makes no Apple request.
 
+### Device resynchronization
+
+A `434/-22421` GrandSlam response is a repair request, not an HTTP transport
+failure. The adapter accepts its Server Intermediate Message only from the fixed
+GrandSlam response body or HTTP header. The local helper calls Mavericks AOSKit's
+named synchronization wrapper with the existing `-2` device state and returns only
+the generated MID and Server Response Message. The client then performs a fresh,
+unauthenticated URL-bag lookup and sends those values plus the existing routing
+number to the returned `midSyncMachine` URL. Both URLs must be HTTPS on exactly
+`gsa.apple.com`, port 443, below `/grandslam/`; redirects are refused.
+
+After an `ec 0` response, any returned routing value is validated and stored under
+the same per-user lock. The failed `init` or `complete` operation is retried once
+with a newly generated OTP. This bound prevents a repeated server challenge from
+creating a request loop. The original password, SRP proof, verification code and
+service tokens never cross the helper IPC or enter the synchronization request.
+
 ## Install and try a sign-in
 
 Install or update the built libraries with:
@@ -209,6 +240,10 @@ A source build alone does not update installed libraries.
 Quit and reopen System Preferences, then sign in normally. A reboot is not required
 for the preference pane's own requests. If an account helper owns the request, that
 process must also be restarted to load updated code.
+
+Existing provisioned machines are repaired automatically when Apple requests it.
+Do not delete `/Users/Shared/adi` or AquaTransport's Anisette metadata in response
+to `434/-22421`; deleting either can make the existing machine state unrecoverable.
 
 For trusted-device two-factor authentication, the first attempt requests a code and
 returns an authentication failure to the old client. Approve the request on the
@@ -496,7 +531,10 @@ any attempt to use it fails the tests. Coverage includes independent Python SRP
 server vectors for `s2k`, `s2k_fo`, leading-zero salts, short public keys and short
 shared secrets; invalid public values and
 iteration counts; short/incorrect/repeated proofs; full token conversion; malformed
-responses; missing anisette; refused redirects; trusted-device retry (including
+responses; missing anisette; refused redirects; device resynchronization during
+both `init` and `complete`; body- and header-carried server messages; fresh OTP
+generation; optional routing updates; one-retry enforcement; malformed/missing
+messages; native and Apple-side sync failures; trusted-device retry (including
 password-only resends, passwords ending in six or more digits, numeric-only
 passwords, Unicode, changed passwords outside the code format, correction after a
 rejected code, and wrong passwords of the expected length that cannot bypass SRP);
@@ -519,8 +557,9 @@ without reading credentials or starting Apple sign-in. Its `--selftest` mode
 checks field mapping and the provisioning state machine with synthetic native
 routines and HTTP replies: the full 64-bit identifier, routing persistence,
 failed-session cleanup, cooldown, invalid Apple responses and request bounds.
-`tools/anisette-service-test.m` runs those provisioning cases through the helper's
-actual transport. `tools/anisette-ipc-test.m` checks socket framing, error replies,
+`tools/anisette-service-test.m` runs those provisioning cases and the native
+synchronization/output-bound/routing cases through the helper's actual transport.
+`tools/anisette-ipc-test.m` checks all three local operations, socket framing, error replies,
 oversized/truncated data, cancellation, an unavailable service and rejection of
 an unexpected server identity on both Intel
 architectures and in a GC host.

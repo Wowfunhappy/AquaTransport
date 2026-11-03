@@ -1,6 +1,7 @@
-/* Socket-activated native Anisette generator. Clients can request only one operation:
- * generate device headers. Account identities/passwords/tokens never cross IPC.
- * Apple's provisioning HTTPS exchange runs only for missing native state. */
+/* Socket-activated native Anisette generator. Clients can generate device headers,
+ * transform Apple's resynchronization challenge, or persist returned routing.
+ * Account identities/passwords/tokens never cross IPC. Apple's provisioning HTTPS
+ * exchange runs only for missing native state. */
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
 #include <openssl/evp.h>
@@ -16,9 +17,9 @@
 #include <sys/select.h>
 #include <mach/mach_time.h>
 #include "aquatransport_anisette_service.h"
+#include "aquatransport_client_info.inc"
 
 static NSString *const AQErrorDomain = @"AquaTransport.iCloud";
-static NSString *const AQClient = @"<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
 /* The shared generator accepts cancellation owners in the adapter/diagnostic;
  * the service always passes nil. No implementation of this client class here. */
 @interface AQGSAProtocol : NSObject
@@ -58,7 +59,7 @@ static NSMutableURLRequest *aq_apple_request(NSString *url, NSDictionary *header
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
     [req setValue:@"text/x-xml-plist" forHTTPHeaderField:@"Accept"];
     [req setValue:@"akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0" forHTTPHeaderField:@"User-Agent"];
-    [req setValue:AQClient forHTTPHeaderField:@"X-Mme-Client-Info"];
+    [req setValue:aq_client_info() forHTTPHeaderField:@"X-Mme-Client-Info"];
     for (NSString *key in headers) [req setValue:[headers objectForKey:key] forHTTPHeaderField:key];
     return req;
 }
@@ -121,6 +122,15 @@ static BOOL sendAll(int fd, const void *bytes, size_t length) {
     }
     return YES;
 }
+static BOOL receiveAll(int fd, void *bytes, size_t length) {
+    while (length) {
+        ssize_t n = recv(fd, bytes, length, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return NO;
+        bytes = (char *)bytes + n; length -= n;
+    }
+    return YES;
+}
 /* A fresh, unprivileged process owns Foundation and Apple's native state.
  * The broker gets the identity from the kernel, never from client input. */
 static int runWorker(void) {
@@ -131,12 +141,30 @@ static int runWorker(void) {
     struct timeval limit = {3, 0};
     setsockopt(STDIN_FILENO, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof limit);
     setsockopt(STDIN_FILENO, SOL_SOCKET, SO_SNDTIMEO, &limit, sizeof limit);
-    unsigned char operation = 0;
-    if (recv(STDIN_FILENO, &operation, 1, 0) != 1 || operation != 1) { [pool drain]; return 2; }
-    NSError *error = nil; NSDictionary *headers = nil;
-    @try { headers = [AQNativeAnisetteGenerator headersForOwner:nil error:&error]; }
+    unsigned char operation = 0; NSMutableData *request = nil;
+    if (recv(STDIN_FILENO, &operation, 1, 0) != 1 || operation < 1 || operation > 3) { [pool drain]; return 2; }
+    if (operation != 1) {
+        uint32_t length = 0;
+        if (!receiveAll(STDIN_FILENO, &length, sizeof length) || !(length = ntohl(length)) || length > 1024*1024) { [pool drain]; return 2; }
+        request = [NSMutableData dataWithLength:length];
+        if (!receiveAll(STDIN_FILENO, [request mutableBytes], length)) { [pool drain]; return 2; }
+    }
+    NSError *error = nil; NSDictionary *result = nil;
+    @try {
+        if (operation == 1) {
+            NSDictionary *headers = [AQNativeAnisetteGenerator headersForOwner:nil error:&error];
+            if (headers) result = [NSDictionary dictionaryWithObject:headers forKey:@"headers"];
+        } else if (operation == 2) {
+            NSDictionary *synchronization = [AQNativeAnisetteGenerator synchronizeServerData:request owner:nil error:&error];
+            if (synchronization) result = [NSDictionary dictionaryWithObject:synchronization forKey:@"synchronization"];
+        } else {
+            NSString *routing = [[[NSString alloc] initWithData:request encoding:NSASCIIStringEncoding] autorelease];
+            if ([AQNativeAnisetteGenerator storeRouting:routing owner:nil error:&error])
+                result = [NSDictionary dictionaryWithObject:[NSNumber numberWithBool:YES] forKey:@"stored"];
+        }
+    }
     @catch (NSException *e) { error = aq_error(11, @"Local device authentication failed inside Apple's framework."); }
-    NSDictionary *reply = headers ? [NSDictionary dictionaryWithObject:headers forKey:@"headers"] :
+    NSDictionary *reply = result ?:
         [NSDictionary dictionaryWithObjectsAndKeys:[NSNumber numberWithInteger:[error code]], @"error",
             [error localizedDescription] ?: @"Local device authentication failed.", @"message", nil];
     NSData *data = aq_encode(reply); uint32_t length = htonl((uint32_t)[data length]);

@@ -1162,7 +1162,7 @@
 				<key>USE_HFS+_COMPRESSION</key>
 				<false/>
 				<key>VERSION</key>
-				<string>2026.10.25</string>
+				<string>2026.11.04</string>
 			</dict>
 			<key>TYPE</key>
 			<integer>0</integer>
@@ -1670,7 +1670,7 @@
 				<key>USE_HFS+_COMPRESSION</key>
 				<false/>
 				<key>VERSION</key>
-				<string>2026.10.21</string>
+				<string>2026.11.03</string>
 			</dict>
 			<key>TYPE</key>
 			<integer>0</integer>

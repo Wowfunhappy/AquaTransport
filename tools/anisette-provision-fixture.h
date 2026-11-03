@@ -1,7 +1,7 @@
 /* Offline coverage of the production provisioning/state machine. Only native
  * cryptographic calls and HTTPS responses are replaced; metadata uses scratch
  * files. No Apple framework, account, keychain or real device state is touched. */
-static int adiMode, adiRequests, adiStarts, adiFinishes, adiDestroys, adiOTPs, adiState;
+static int adiMode, adiRequests, adiStarts, adiFinishes, adiDestroys, adiOTPs, adiSyncs, adiState;
 static int fakeState(uint64_t dsid) { assert(dsid == UINT64_MAX-1); return adiState; }
 static int fakeDispose(void *p) { free(p); return 0; }
 static int fakeStart(uint64_t dsid, const void *p, uint32_t n, void **out, uint32_t *size, uint32_t *session) {
@@ -19,6 +19,12 @@ static int fakeOTP(uint64_t dsid, void **machine, uint32_t *ml, void **otp, uint
     assert(dsid == UINT64_MAX-1); adiOTPs++;
     *machine = strdup("machine"); *ml = 7; *otp = strdup("otp"); *ol = 3; return 0;
 }
+static int fakeSync(uint64_t dsid, const void *server, uint32_t length, void **mid, uint32_t *ml, void **srm, uint32_t *sl) {
+    assert(dsid == UINT64_MAX-1 && length == 11 && !memcmp(server, "server-sync", 11)); adiSyncs++;
+    if (adiMode == 1) return -1;
+    *mid = strdup("mid"); *ml = adiMode == 2 ? 20000 : 3;
+    *srm = strdup("client-sync"); *sl = 11; return 0;
+}
 @interface AQProvisionFixture : NSURLProtocol @end
 @implementation AQProvisionFixture
 + (BOOL)canInitWithRequest:(NSURLRequest *)req { return YES; }
@@ -28,6 +34,7 @@ static int fakeOTP(uint64_t dsid, void **machine, uint32_t *ml, void **otp, uint
     NSURLRequest *req = [self request]; adiRequests++;
     assert(adiRequests <= 3 && aq_adi_url([[req URL] absoluteString]));
     assert(![req valueForHTTPHeaderField:@"Authorization"] && ![req valueForHTTPHeaderField:@"X-Apple-I-MD"]);
+    assert([[req valueForHTTPHeaderField:@"X-Mme-Client-Info"] isEqual:aq_client_info()]);
     NSDictionary *result = nil; NSInteger status = 200;
     switch (adiRequests) {
         case 1:
@@ -88,4 +95,26 @@ static void testProvisioning(void) {
     [NSURLProtocol unregisterClass:[AQProvisionFixture class]];
     memset(&AQADI, 0, sizeof AQADI);
     puts("PASS: native provisioning, 64-bit DSID, routing persistence, failed-session cleanup, cooldown and request bounds (11 cases)");
+}
+
+static void testSynchronization(void) {
+    memset(&AQADI, 0, sizeof AQADI); AQADI.state = fakeState; AQADI.sync = fakeSync; AQADI.dispose = fakeDispose;
+    char path[] = "/tmp/aquatransport-sync.XXXXXX"; int fd = mkstemp(path); assert(fd >= 0); unlink(path);
+    NSMutableDictionary *record = [NSMutableDictionary dictionaryWithObjectsAndKeys:@"fixture-device", @"device", @"12345", @"routing", nil];
+    assert(aq_adi_save(fd, record)); NSData *server = [@"server-sync" dataUsingEncoding:NSUTF8StringEncoding];
+    NSError *error = nil; adiMode = 0; adiState = 0; adiSyncs = 0;
+    NSDictionary *result = aq_adi_synchronize(server, @"fixture-device", fd, &error);
+    assert(result && !error && adiSyncs == 1 && [[result objectForKey:@"mid"] isEqual:[@"mid" dataUsingEncoding:NSUTF8StringEncoding]] &&
+        [[result objectForKey:@"srm"] isEqual:[@"client-sync" dataUsingEncoding:NSUTF8StringEncoding]]);
+    assert(aq_adi_store_routing(@"67890", @"fixture-device", fd, &error));
+    assert([[aq_adi_read(fd) objectForKey:@"routing"] isEqual:@"67890"]);
+    error = nil; assert(!aq_adi_store_routing(@"bad\r\nroute", @"fixture-device", fd, &error) && [error code] == 28);
+    error = nil; adiMode = 1; assert(!aq_adi_synchronize(server, @"fixture-device", fd, &error) && [error code] == 29);
+    error = nil; adiMode = 2; assert(!aq_adi_synchronize(server, @"fixture-device", fd, &error) && [error code] == 29);
+    error = nil; adiMode = 0; adiState = -1; assert(!aq_adi_synchronize(server, @"fixture-device", fd, &error) && [error code] == 12);
+    error = nil; adiState = 0; assert(!aq_adi_synchronize([NSData data], @"fixture-device", fd, &error) && [error code] == 28);
+    [record removeObjectForKey:@"routing"]; assert(aq_adi_save(fd, record));
+    error = nil; assert(!aq_adi_synchronize(server, @"fixture-device", fd, &error) && [error code] == 18);
+    close(fd); memset(&AQADI, 0, sizeof AQADI);
+    puts("PASS: native device synchronization, output bounds and routing persistence (8 cases)");
 }

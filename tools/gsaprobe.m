@@ -13,7 +13,7 @@
 #include "local-anisette-fixture.h"
 
 static NSString *mode;
-static int unexpected, anisetteCalls, initCalls, completeCalls, accountCalls, codeCalls;
+static int unexpected, anisetteCalls, initCalls, completeCalls, accountCalls, codeCalls, syncCalls, syncHTTPCalls, routingCalls;
 static NSData *serverB, *serverKey, *serverProof;
 static BOOL verified, changedPassword;
 static BOOL fixture(NSString *name) { return [mode isEqual:name] || [mode isEqual:[@"ids-" stringByAppendingString:name]]; }
@@ -35,12 +35,25 @@ static NSString *settingsAuth(void) {
 static NSString *expectedClient(void) {
     return AQTestClient;
 }
+static NSData *bytes(NSString *s);
 
 static id localOTP(id self, SEL selector, id owner, NSError **error) {
     anisetteCalls++;
     if (fixture(@"missing-anisette") || [mode isEqual:@"settings-missing"]) return @{};
-    return @{@"X-Apple-MD": @"fake-otp", @"X-Apple-MD-M": @"fake-machine", @"X-Apple-I-MD-RINFO": @"12345",
+    NSString *otp = [mode hasPrefix:@"resync"] && syncCalls ? @"fresh-otp" : @"fake-otp";
+    return @{@"X-Apple-MD": otp, @"X-Apple-MD-M": @"fake-machine", @"X-Apple-I-MD-RINFO": @"12345",
         @"Authorization": @"MUST-NOT-BE-FORWARDED", @"X-MMe-Client-Info": @"MUST-NOT-BE-FORWARDED"};
+}
+static id localSync(id self, SEL selector, NSData *server, id owner, NSError **error) {
+    syncCalls++; assert([server isEqual:bytes(@"server-sync")]);
+    if ([mode isEqual:@"resync-native-failure"]) {
+        *error = [NSError errorWithDomain:@"fixture" code:29 userInfo:@{NSLocalizedDescriptionKey:@"fixture sync failure"}];
+        return nil;
+    }
+    return @{@"mid":bytes(@"fresh-mid"), @"srm":bytes(@"client-sync")};
+}
+static BOOL localStoreRouting(id self, SEL selector, NSString *routing, id owner, NSError **error) {
+    routingCalls++; assert([routing isEqual:@"67890"]); return YES;
 }
 
 static NSData *plist(id obj) { return [NSPropertyListSerialization dataWithPropertyList:obj format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL]; }
@@ -105,7 +118,7 @@ static NSData *encrypted_session(void) {
 - (void)stopLoading {}
 - (void)startLoading {
     NSURLRequest *req = [self request]; NSString *host = [[req URL] host], *path = [[req URL] path];
-    NSData *data = nil; NSDictionary *result = nil; int status = 200;
+    NSData *data = nil; NSDictionary *result = nil, *responseHeaders = nil; int status = 200;
     if (fixture(@"disabled")) {
         assert(![NSURLProtocol propertyForKey:@"AquaTransportGSAHandled" inRequest:req]);
         assert([[[parse([req HTTPBody]) objectForKey:@"password"] description] isEqual:@"Synthetic:PassWord"]);
@@ -122,7 +135,8 @@ static NSData *encrypted_session(void) {
         assert([[req valueForHTTPHeaderField:@"Accept"] isEqual:@"*/*"]);
         NSDictionary *payload = [parse([req HTTPBody]) objectForKey:@"Request"];
         assert([[payload objectForKey:@"u"] isEqual:@"test@example.invalid"]);
-        assert([[[payload objectForKey:@"cpd"] objectForKey:@"X-Apple-I-MD"] isEqual:@"fake-otp"]);
+        NSString *expectedOTP = [mode hasPrefix:@"resync"] && syncCalls ? @"fresh-otp" : @"fake-otp";
+        assert([[[payload objectForKey:@"cpd"] objectForKey:@"X-Apple-I-MD"] isEqual:expectedOTP]);
         assert(![[payload objectForKey:@"cpd"] objectForKey:@"Authorization"]);
         NSDictionary *cpd = [payload objectForKey:@"cpd"];
         assert([[cpd objectForKey:@"svct"] isEqual:@"iCloud"] && [[cpd objectForKey:@"prkgen"] boolValue]);
@@ -145,6 +159,15 @@ static NSData *encrypted_session(void) {
         }
         NSMutableDictionary *r = [[result mutableCopy] autorelease];
         NSMutableDictionary *s = [NSMutableDictionary dictionaryWithObjectsAndKeys:@0, @"ec", @200, @"hsc", nil];
+        BOOL resyncInit = [mode hasPrefix:@"resync"] && ![mode isEqual:@"resync-complete"] &&
+            ([[payload objectForKey:@"o"] isEqual:@"init"] && (initCalls == 1 || [mode isEqual:@"resync-repeat"]));
+        BOOL resyncComplete = [mode isEqual:@"resync-complete"] && [[payload objectForKey:@"o"] isEqual:@"complete"] && completeCalls == 1;
+        if (resyncInit || resyncComplete) {
+            [r removeAllObjects]; [s setObject:@-22421 forKey:@"ec"]; [s setObject:@434 forKey:@"hsc"];
+            if (![mode isEqual:@"resync-missing"] && ![mode isEqual:@"resync-header"])
+                [s setObject:[mode isEqual:@"resync-malformed"] ? @"***=" : @"c2VydmVyLXN5bmM=" forKey:@"X-Apple-I-MD-DATA"];
+            if ([mode isEqual:@"resync-header"]) responseHeaders = @{@"x-apple-i-md-data":@"c2VydmVyLXN5bmM="};
+        }
         if (fixture(@"2fa-wrong-password") && completeCalls == 3 && [[payload objectForKey:@"o"] isEqual:@"complete"]) {
             /* A valid code and matching length cannot substitute for the password. */
             [s setObject:@-20101 forKey:@"ec"];
@@ -152,6 +175,21 @@ static NSData *encrypted_session(void) {
         }
         if (completeCalls && twoFactor() && !verified) { [s setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"]; [s setObject:@409 forKey:@"hsc"]; }
         [r setObject:s forKey:@"Status"]; result = [NSDictionary dictionaryWithObject:r forKey:@"Response"];
+    } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2/lookup"]) {
+        assert(syncCalls == 1 && ![req HTTPBody] && ![req valueForHTTPHeaderField:@"Authorization"]);
+        result = @{@"urls":@{@"midSyncMachine":[mode isEqual:@"resync-invalid-url"] ?
+            @"https://other.invalid/grandslam/syncMachine" : @"https://gsa.apple.com/grandslam/syncMachine"}};
+    } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/syncMachine"]) {
+        syncHTTPCalls++;
+        NSDictionary *outer = parse([req HTTPBody]), *body = [outer objectForKey:@"Request"];
+        assert([[req HTTPMethod] isEqual:@"POST"] && [[[outer objectForKey:@"Header"] allKeys] count] == 0);
+        assert([[body objectForKey:@"srm"] isEqual:@"Y2xpZW50LXN5bmM="] && [[body objectForKey:@"X-Apple-I-MD-M"] isEqual:@"ZnJlc2gtbWlk"]);
+        assert([[body objectForKey:@"X-Apple-I-MD-RINFO"] unsignedLongLongValue] == 12345);
+        assert(![req valueForHTTPHeaderField:@"Authorization"] && ![req valueForHTTPHeaderField:@"X-Apple-I-MD"]);
+        NSMutableDictionary *reply = [NSMutableDictionary dictionaryWithObject:
+            @{@"ec":[mode isEqual:@"resync-server-failure"] ? @-1 : @0} forKey:@"Status"];
+        if ([mode isEqual:@"resync-routing"]) [reply setObject:@"67890" forKey:@"X-Apple-I-MD-RINFO"];
+        result = @{@"Response":reply};
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/auth/verify/trusteddevice"]) {
         codeCalls++; assert([req valueForHTTPHeaderField:@"X-Apple-Identity-Token"]);
         result = [NSDictionary dictionary];
@@ -171,7 +209,7 @@ static NSData *encrypted_session(void) {
         NSDictionary *delegates = [body objectForKey:@"delegates"];
         assert([delegates count] == 1 && [[delegates objectForKey:@"com.apple.madrid"] isKindOfClass:[NSDictionary class]]);
         assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:@"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6ZmFrZS1wZXQ="]);
-        assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD"] isEqual:@"fake-otp"]);
+        assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD"] isEqual:[mode hasPrefix:@"resync"] ? @"fresh-otp" : @"fake-otp"]);
         assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD-M"] isEqual:@"fake-machine"]);
         assert([[req valueForHTTPHeaderField:@"X-Apple-ADSID"] isEqual:@"12345"]);
         assert(![req valueForHTTPHeaderField:@"Content-Encoding"]);
@@ -207,7 +245,7 @@ static NSData *encrypted_session(void) {
         [[self client] URLProtocol:self wasRedirectedToRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.invalid/collect"]] redirectResponse:r];
         return;
     }
-    NSHTTPURLResponse *r = [[[NSHTTPURLResponse alloc] initWithURL:[req URL] statusCode:status HTTPVersion:@"HTTP/1.1" headerFields:nil] autorelease];
+    NSHTTPURLResponse *r = [[[NSHTTPURLResponse alloc] initWithURL:[req URL] statusCode:status HTTPVersion:@"HTTP/1.1" headerFields:responseHeaders] autorelease];
     [[self client] URLProtocol:self didReceiveResponse:r cacheStoragePolicy:NSURLCacheStorageNotAllowed];
     [[self client] URLProtocol:self didLoadData:data]; [[self client] URLProtocolDidFinishLoading:self];
 }
@@ -297,7 +335,9 @@ int main(int argc, char **argv) {
     assert([NSGarbageCollector defaultCollector] != nil);
 #endif
     [NSURLProtocol registerClass:[AQMock class]];
-    if (!fixture(@"disabled")) aq_test_install_otp((IMP)localOTP);
+    if (!fixture(@"disabled")) {
+        aq_test_install_otp((IMP)localOTP); aq_test_install_sync((IMP)localSync); aq_test_install_routing((IMP)localStoreRouting);
+    }
     if ([mode hasPrefix:@"ids-"]) {
         NSURLResponse *response = nil; NSError *error = nil;
         NSData *data = [NSURLConnection sendSynchronousRequest:idsLogin(testPassword()) returningResponse:&response error:&error];
@@ -400,7 +440,9 @@ int main(int argc, char **argv) {
         assert(([(NSHTTPURLResponse *)response statusCode] == 401 || [error code] == NSURLErrorUserCancelledAuthentication) && codeCalls == 1 && accountCalls == 0);
         data = finishTwoFactor(NO, &response, &error);
     }
-    BOOL success = [mode isEqual:@"success"] || twoFactor();
+    BOOL resyncSuccess = [mode isEqual:@"resync"] || [mode isEqual:@"resync-header"] ||
+        [mode isEqual:@"resync-complete"] || [mode isEqual:@"resync-routing"];
+    BOOL success = [mode isEqual:@"success"] || twoFactor() || resyncSuccess;
     if (error) fprintf(stderr, "fixture error: %s (%ld), init=%d complete=%d account=%d\n", [[error localizedDescription] UTF8String], (long)[error code], initCalls, completeCalls, accountCalls);
     if (success) {
         assert(!error && [(NSHTTPURLResponse *)response statusCode] == 200);
@@ -424,7 +466,27 @@ int main(int argc, char **argv) {
         NSDate *limit = [NSDate dateWithTimeIntervalSinceNow:0.2];
         while ([limit timeIntervalSinceNow] > 0) [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:limit];
         assert(client->callbacks == 0); [cancel release]; [client release];
-    } else { assert(error && accountCalls == 0); }
+        if (resyncSuccess) {
+            assert(syncCalls == 1 && syncHTTPCalls == 1 && anisetteCalls == 3);
+            assert(initCalls == ([mode isEqual:@"resync-complete"] ? 1 : 2));
+            assert(completeCalls == ([mode isEqual:@"resync-complete"] ? 2 : 1));
+            assert(routingCalls == ([mode isEqual:@"resync-routing"] ? 1 : 0));
+        }
+    } else {
+        assert(error && accountCalls == 0);
+        if ([mode hasPrefix:@"resync"]) {
+            if ([mode isEqual:@"resync-missing"] || [mode isEqual:@"resync-malformed"])
+                assert(syncCalls == 0 && syncHTTPCalls == 0 && initCalls == 1);
+            else if ([mode isEqual:@"resync-native-failure"])
+                assert(syncCalls == 1 && syncHTTPCalls == 0 && initCalls == 1);
+            else if ([mode isEqual:@"resync-server-failure"])
+                assert(syncCalls == 1 && syncHTTPCalls == 1 && initCalls == 1);
+            else if ([mode isEqual:@"resync-invalid-url"])
+                assert(syncCalls == 1 && syncHTTPCalls == 0 && initCalls == 1);
+            else if ([mode isEqual:@"resync-repeat"])
+                assert(syncCalls == 1 && syncHTTPCalls == 1 && initCalls == 2 && anisetteCalls == 2);
+        }
+    }
     assert(anisetteCalls && (initCalls || [mode isEqual:@"missing-anisette"]) && unexpected == 0);
     printf("PASS: offline %s via lazy module and NSURLConnection\n", [mode UTF8String]);
     [pool drain]; return 0;

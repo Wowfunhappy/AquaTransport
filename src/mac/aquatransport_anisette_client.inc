@@ -29,7 +29,8 @@ static BOOL aq_adi_io(int fd, void *bytes, size_t length, BOOL writing, AQGSAPro
     }
     return !length;
 }
-static NSDictionary *aq_adi_client(AQGSAProtocol *owner, NSError **error, const char *path, uid_t expectedPeer) {
+static NSDictionary *aq_adi_client(AQGSAProtocol *owner, NSError **error, const char *path, uid_t expectedPeer,
+                                    unsigned char operation, NSData *request) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0 || fd >= FD_SETSIZE) { if (fd >= 0) close(fd); *error = aq_error(10, @"Could not open the local Anisette service."); return nil; }
     @try {
@@ -47,28 +48,43 @@ static NSDictionary *aq_adi_client(AQGSAProtocol *owner, NSError **error, const 
         uid_t uid; gid_t gid;
         if (getpeereid(fd, &uid, &gid) || uid != expectedPeer) { *error = aq_error(10, @"The local Anisette service has an unexpected owner."); return nil; }
         NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:100];
-        unsigned char operation = 1; uint32_t length = 0;
-        if (!aq_adi_io(fd, &operation, 1, YES, owner, deadline) || !aq_adi_io(fd, &length, sizeof length, NO, owner, deadline)) {
+        NSUInteger fullRequestLength = [request length];
+        uint32_t requestLength = (uint32_t)fullRequestLength, wireLength = htonl(requestLength), length = 0;
+        if ((operation != 1 && operation != 2 && operation != 3) || fullRequestLength > 1024*1024 ||
+            !aq_adi_io(fd, &operation, 1, YES, owner, deadline) ||
+            (operation != 1 && (!requestLength || !aq_adi_io(fd, &wireLength, sizeof wireLength, YES, owner, deadline) ||
+                !aq_adi_io(fd, (void *)[request bytes], requestLength, YES, owner, deadline))) ||
+            !aq_adi_io(fd, &length, sizeof length, NO, owner, deadline)) {
             *error = aq_error([owner isStopped] ? NSUserCancelledError : 19, @"Local device authentication was cancelled or could not complete."); return nil;
         }
         length = ntohl(length);
         if (!length || length > 65536) { *error = aq_error(19, @"Invalid local device authentication response."); return nil; }
         NSMutableData *data = [NSMutableData dataWithLength:length];
         if (!aq_adi_io(fd, [data mutableBytes], length, NO, owner, deadline)) { *error = aq_error(19, @"Incomplete local device authentication response."); return nil; }
-        NSDictionary *reply = aq_plist(data), *headers = aq_dict([reply objectForKey:@"headers"]);
-        if (!headers) {
+        NSDictionary *reply = aq_plist(data);
+        if (![reply isKindOfClass:[NSDictionary class]] || [reply objectForKey:@"error"]) {
             NSNumber *code = [reply objectForKey:@"error"];
             NSString *message = aq_device_field([reply objectForKey:@"message"]);
             *error = aq_error([code isKindOfClass:[NSNumber class]] ? [code integerValue] : 19, message ?: @"Local device authentication failed.");
+            return nil;
         }
-        return headers;
+        return reply;
     } @finally { close(fd); }
 }
 @interface AQNativeAnisette : NSObject
 + (NSDictionary *)headersForOwner:(AQGSAProtocol *)owner error:(NSError **)error;
++ (NSDictionary *)synchronizeServerData:(NSData *)server owner:(AQGSAProtocol *)owner error:(NSError **)error;
++ (BOOL)storeRouting:(NSString *)routing owner:(AQGSAProtocol *)owner error:(NSError **)error;
 @end
 @implementation AQNativeAnisette
 + (NSDictionary *)headersForOwner:(AQGSAProtocol *)owner error:(NSError **)error {
-    return aq_adi_client(owner, error, AQ_ANISETTE_SOCKET, 0);
+    return aq_dict([aq_adi_client(owner, error, AQ_ANISETTE_SOCKET, 0, 1, nil) objectForKey:@"headers"]);
+}
++ (NSDictionary *)synchronizeServerData:(NSData *)server owner:(AQGSAProtocol *)owner error:(NSError **)error {
+    return aq_dict([aq_adi_client(owner, error, AQ_ANISETTE_SOCKET, 0, 2, server) objectForKey:@"synchronization"]);
+}
++ (BOOL)storeRouting:(NSString *)routing owner:(AQGSAProtocol *)owner error:(NSError **)error {
+    NSData *request = [routing dataUsingEncoding:NSASCIIStringEncoding];
+    return [[[aq_adi_client(owner, error, AQ_ANISETTE_SOCKET, 0, 3, request) objectForKey:@"stored"] description] boolValue];
 }
 @end
