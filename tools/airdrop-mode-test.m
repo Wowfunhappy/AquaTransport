@@ -22,6 +22,7 @@ static void stop_browser(id browser,SEL selector) { (void)selector; [events addO
 static void stop_server(id server,SEL selector) { (void)selector; [events addObject:@"server stop"]; [active_servers removeObject:server]; }
 static void start_browser(id browser,SEL selector) { (void)selector; [events addObject:@"browser start"]; [active_browsers addObject:browser]; }
 static void start_server(id server,SEL selector) { (void)selector; [events addObject:@"server start"]; [active_servers addObject:server]; }
+static void restart_server(id server) { start_server(server,@selector(start)); }
 static void force_stop_radio(void) { [events addObject:@"radio stop"]; }
 #include "../src/mac/airdrop/AQMode.inc"
 #include "../src/mac/airdrop/AQPendingRetry.inc"
@@ -31,22 +32,22 @@ int main(void) { @autoreleasepool {
     pending_browsers=[NSHashTable weakObjectsHashTable]; pending_servers=[NSHashTable weakObjectsHashTable];
     CachedBrowser *browser=[CachedBrowser new]; browser.services=@[@"Test iPhone"]; browser.published=browser.services;
     NSObject *server=[NSObject new]; [active_browsers addObject:browser]; [active_servers addObject:server];
-    install_mode_observer();
+    mode_observer=[AQModeObserver new];
     active_transfers=1;
-    [[NSDistributedNotificationCenter defaultCenter] postNotificationName:AQModeRequest
-        object:@"org.aquatransport.airdrop" userInfo:@{@"native":@YES} deliverImmediately:YES];
+    [mode_observer modeRequested:[NSNotification notificationWithName:AQModeRequest
+        object:nil userInfo:@{@"native":@YES}]];
     drain(); assert(!native_mode && !events.count);
     active_transfers=0; apply_pending_mode(); drain();
     assert(native_mode);
     assert(browser.published.count==0);
     assert(([events isEqual:@[@"browser stop",@"server stop",@"browser notify",@"radio stop",@"server start",@"browser start"]]));
     [events removeAllObjects];
-    [[NSDistributedNotificationCenter defaultCenter] postNotificationName:AQModeRequest
-        object:@"org.aquatransport.airdrop" userInfo:@{@"native":@NO} deliverImmediately:YES];
+    [mode_observer modeRequested:[NSNotification notificationWithName:AQModeRequest
+        object:nil userInfo:@{@"native":@NO}]];
     drain(); assert(!native_mode);
     assert(([events isEqual:@[@"browser stop",@"server stop",@"browser notify",@"server start",@"browser start"]]));
-    [[NSDistributedNotificationCenter defaultCenter] postNotificationName:AQModeRequest
-        object:@"org.aquatransport.airdrop" userInfo:@{@"native":@YES} deliverImmediately:YES];
+    [mode_observer modeRequested:[NSNotification notificationWithName:AQModeRequest
+        object:nil userInfo:@{@"native":@YES}]];
     drain(); assert(native_mode);
     mode_heartbeat_at=0; expire_mode_owner(); drain(); assert(!native_mode);
     [events removeAllObjects];

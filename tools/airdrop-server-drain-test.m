@@ -65,7 +65,7 @@ int main(void){@autoreleasepool {
  receive_event(incoming,NULL,9);wait_ms(80);assert(invalidations==1 && !CFDictionaryGetCount(server->_connections));
  release_radio(incoming);
  // A connection that never closes is retried a bounded number of times.
- stubborn=YES;server=stopped_server(1);drain_after_stop(server);wait_ms(600);
+ stubborn=YES;server=stopped_server(1);drain_after_stop(server);drain_after_stop(server);wait_ms(600);
  assert(invalidations==AQ_SERVER_DRAIN_ATTEMPTS);
  server=nil;current=nil;stubborn=NO;
  // Native dealloc calls stop again. Queued cleanup must not retain a receiver

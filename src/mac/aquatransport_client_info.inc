@@ -6,6 +6,7 @@
 
 #include <sys/types.h>
 #include <sys/sysctl.h>
+#include <sys/utsname.h>
 
 static BOOL aq_client_component(NSString *value, NSString *allowed, NSUInteger maximum) {
     return [value isKindOfClass:[NSString class]] && [value length] && [value length] <= maximum &&
@@ -24,6 +25,17 @@ static NSString *aq_client_info(void) {
         !aq_client_component(version, @"0123456789.", 32) || !aq_client_component(build, letters, 32)) return nil;
     return [NSString stringWithFormat:@"<%@> <Mac OS X;%@;%@> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
         hardware, version, build];
+}
+
+static NSString *aq_akd_user_agent(void) {
+    NSBundle *network = [NSBundle bundleWithPath:@"/System/Library/Frameworks/CFNetwork.framework"];
+    NSString *version = [network objectForInfoDictionaryKey:@"CFBundleVersion"];
+    struct utsname system;
+    NSString *letters = @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    if (!aq_client_component(version, @"0123456789.", 32) || uname(&system)) return nil;
+    NSString *release = [NSString stringWithUTF8String:system.release];
+    if (!aq_client_component(release, [letters stringByAppendingString:@"._-"], 32)) return nil;
+    return [NSString stringWithFormat:@"akd/1.0 CFNetwork/%@ Darwin/%@", version, release];
 }
 
 #endif

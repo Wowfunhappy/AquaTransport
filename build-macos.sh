@@ -142,7 +142,7 @@ for a in "${ARCHS[@]}"; do
   aout="$OBJDIR/aquatransport-anisette-$a"
   clang -arch "$a" -mmacosx-version-min=10.7 -O2 -fvisibility=hidden -Wall -Wno-deprecated-declarations \
     -I"$LS_OUT/include" "$DIR/src/mac/aquatransport_anisette_service.m" \
-    "$LS_OUT/lib/libcrypto.a" -framework Foundation -framework IOKit \
+    "$LS_OUT/lib/libcrypto.a" -framework Foundation -framework IOKit -framework CoreServices \
     -Wl,-exported_symbols_list,"$BUILD/nothing.exp" -o "$aout"
   mout="$OBJDIR/aquatransport_maps-$a.dylib"
   "$GSA_CC" -arch "$a" -mmacosx-version-min=10.9 -O2 -fPIC -fvisibility=hidden \

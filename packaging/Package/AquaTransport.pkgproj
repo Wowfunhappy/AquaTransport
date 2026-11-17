@@ -1162,7 +1162,7 @@
 				<key>USE_HFS+_COMPRESSION</key>
 				<false/>
 				<key>VERSION</key>
-				<string>2026.11.04</string>
+				<string>2026.11.15</string>
 			</dict>
 			<key>TYPE</key>
 			<integer>0</integer>

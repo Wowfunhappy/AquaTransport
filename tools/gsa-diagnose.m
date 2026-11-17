@@ -37,6 +37,45 @@ int main(int argc, char **argv) {
     NSAutoreleasePool *pool = [NSAutoreleasePool new];
     [NSURLProtocol registerClass:[AQNoNetwork class]];
     if (argc == 2 && !strcmp(argv[1], "--selftest")) {
+        NSMutableURLRequest *ids = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:
+            @"https://profile.ess.apple.com/WebObjects/VCProfileService.woa/wa/authenticateUser"]];
+        [ids setHTTPMethod:@"POST"];
+        [ids setValue:@"client-a" forHTTPHeaderField:@"x-ds-client-id"];
+        [ids setValue:@"7" forHTTPHeaderField:@"x-protocol-version"];
+        NSDictionary *input = @{@"username":@"test@example.invalid", @"password":@"synthetic123456"};
+        NSDictionary *completed = @{@"test":@"completed-delegate"};
+        aq_ids_retry_remember(ids, input, completed, 100);
+        assert([aq_ids_retry_lookup(ids,input,104) isEqual:completed]);
+        assert([aq_ids_retry_lookup(ids,input,159) isEqual:completed]);
+        assert(!aq_ids_retry_lookup(ids,input,160));
+        assert(!AQIDSRetryResult);
+        for (NSString *field in @[@"username", @"password", @"other-field"]) {
+            NSMutableDictionary *different = [[input mutableCopy] autorelease];
+            [different setObject:@"different" forKey:field];
+            aq_ids_retry_remember(ids,input,completed,100);
+            assert(!aq_ids_retry_lookup(ids,different,104));
+            assert(!aq_ids_retry_lookup(ids,input,105));
+        }
+        for (NSString *field in @[@"x-ds-client-id", @"x-protocol-version"]) {
+            NSMutableURLRequest *different = [[ids mutableCopy] autorelease];
+            [different setValue:@"different" forHTTPHeaderField:field];
+            aq_ids_retry_remember(ids,input,completed,100);
+            assert(!aq_ids_retry_lookup(different,input,104));
+        }
+        NSMutableURLRequest *otherEndpoint = [[ids mutableCopy] autorelease];
+        [otherEndpoint setURL:[NSURL URLWithString:@"https://setup.icloud.com/setup/login_or_create_account"]];
+        aq_ids_retry_remember(ids,input,completed,100);
+        assert(!aq_ids_retry_lookup(otherEndpoint,input,104));
+        puts("PASS: IDS retry cache exact match, expiration, changed account/input/client and endpoint isolation");
+        assert([aq_pet_from_header(aq_base64([@"com.apple.gs.idms.pet:synthetic:token" dataUsingEncoding:NSUTF8StringEncoding])) isEqual:@"synthetic:token"]);
+        assert(!aq_pet_from_header(nil));
+        assert(!aq_pet_from_header(@"fake-pet"));
+        assert(!aq_pet_from_header(@"!!!!"));
+        for (NSString *invalid in @[@"com.apple.gs.xcode.auth:token", @"com.apple.gs.idms.pet:", @"com.apple.gs.idms.pet:bad\nvalue", @"token-without-label"])
+            assert(!aq_pet_from_header(aq_base64([invalid dataUsingEncoding:NSUTF8StringEncoding])));
+        assert(fabs(aq_otp_boundary_delay(26.8) - 3.7) < .001);
+        assert(fabs(aq_otp_boundary_delay(29.9) - .6) < .001);
+        assert(fabs(aq_otp_boundary_delay(30.1) - 30.4) < .001);
         IMP original = aq_test_install_otp((IMP)localOTP);
         for (scenario = 0; scenario <= 10; scenario++) {
             NSError *error = nil;

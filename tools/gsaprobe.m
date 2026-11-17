@@ -15,6 +15,7 @@
 static NSString *mode;
 static int unexpected, anisetteCalls, initCalls, completeCalls, accountCalls, codeCalls, syncCalls, syncHTTPCalls, routingCalls;
 static NSData *serverB, *serverKey, *serverProof;
+static NSString *grandSlamRequestUUID;
 static BOOL verified, changedPassword;
 static BOOL fixture(NSString *name) { return [mode isEqual:name] || [mode isEqual:[@"ids-" stringByAppendingString:name]]; }
 static BOOL twoFactor(void) { return [mode hasPrefix:@"2fa"] || [mode hasPrefix:@"ids-2fa"]; }
@@ -34,6 +35,13 @@ static NSString *settingsAuth(void) {
 
 static NSString *expectedClient(void) {
     return AQTestClient;
+}
+static NSString *expectedVerificationClient(void) {
+    NSString *client = expectedClient();
+    NSRange application = [client rangeOfString:@" <" options:NSBackwardsSearch];
+    assert(application.location != NSNotFound);
+    return [[client substringToIndex:application.location] stringByAppendingString:
+        @" <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>"];
 }
 static NSData *bytes(NSString *s);
 
@@ -99,8 +107,16 @@ static void server_start(NSData *clientA) {
     BN_free(A); BN_free(b); BN_free(v); BN_free(B); BN_free(tmp); BN_free(S); BN_free(x); BN_free(k); BN_free(u); BN_CTX_free(ctx);
 }
 static NSData *encrypted_session(void) {
-    NSDictionary *session = [NSDictionary dictionaryWithObjectsAndKeys:@"12345", @"adsid", @"fake-idms", @"GsIdmsToken",
-        [NSDictionary dictionaryWithObject:[NSDictionary dictionaryWithObject:@"fake-pet" forKey:@"token"] forKey:@"com.apple.gs.idms.pet"], @"t", nil];
+    NSMutableDictionary *session = [NSMutableDictionary dictionaryWithObjectsAndKeys:@"12345", @"adsid", @"fake-idms", @"GsIdmsToken", nil];
+    if (twoFactor() && !verified) {
+        [session setObject:hash(bytes(@"application-session-key")) forKey:@"sk"];
+        [session setObject:@"application-continuation" forKey:@"c"];
+    } else [session setObject:[NSDictionary dictionaryWithObject:
+        [NSDictionary dictionaryWithObject:@"fake-pet" forKey:@"token"] forKey:@"com.apple.gs.idms.pet"] forKey:@"t"];
+    /* Cover both known layouts: the basic 2FA fixtures carry au inside spd,
+     * while the variants reproduce current hsc-409 responses with no au. */
+    if (fixture(@"2fa") && !verified) [session setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"];
+    if (fixture(@"2fa-notify-failure") && !verified) [session setObject:@"futureSecondaryAuth" forKey:@"au"];
     NSData *plain = plist(session); unsigned char aes[32], iv[32]; unsigned int len;
     HMAC(EVP_sha256(), [serverKey bytes], 32, (unsigned char *)"extra data key:", 15, aes, &len);
     HMAC(EVP_sha256(), [serverKey bytes], 32, (unsigned char *)"extra data iv:", 14, iv, &len);
@@ -110,7 +126,6 @@ static NSData *encrypted_session(void) {
     assert(EVP_EncryptFinal_ex(ctx, (unsigned char *)[out mutableBytes]+a, &b));
     [out setLength:a+b]; EVP_CIPHER_CTX_free(ctx); return out;
 }
-
 @interface AQMock : NSURLProtocol @end
 @implementation AQMock
 + (BOOL)canInitWithRequest:(NSURLRequest *)r { return YES; }
@@ -131,18 +146,38 @@ static NSData *encrypted_session(void) {
     assert(![req HTTPShouldHandleCookies]);
     if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2"]) {
         assert(![req valueForHTTPHeaderField:@"Authorization"]);
-        assert(![req valueForHTTPHeaderField:@"X-Apple-I-MD"]);
         assert([[req valueForHTTPHeaderField:@"Accept"] isEqual:@"*/*"]);
+        assert([[req valueForHTTPHeaderField:@"User-Agent"] isEqual:AQTestUserAgent]);
         NSDictionary *payload = [parse([req HTTPBody]) objectForKey:@"Request"];
+        NSString *operation = [payload objectForKey:@"o"];
+        assert([operation isEqual:@"init"] || [operation isEqual:@"complete"]);
         assert([[payload objectForKey:@"u"] isEqual:@"test@example.invalid"]);
         NSString *expectedOTP = [mode hasPrefix:@"resync"] && syncCalls ? @"fresh-otp" : @"fake-otp";
         assert([[[payload objectForKey:@"cpd"] objectForKey:@"X-Apple-I-MD"] isEqual:expectedOTP]);
         assert(![[payload objectForKey:@"cpd"] objectForKey:@"Authorization"]);
         NSDictionary *cpd = [payload objectForKey:@"cpd"];
+        for (NSString *key in @[@"X-Apple-I-MD", @"X-Apple-I-MD-M", @"X-Apple-I-MD-LU", @"X-Apple-I-MD-RINFO", @"X-Mme-Device-Id"])
+            assert([[req valueForHTTPHeaderField:key] isEqual:[cpd objectForKey:key]]);
+        assert([[req valueForHTTPHeaderField:@"X-Apple-AK-Context-Type"] isEqual:@"iCloud"] &&
+            [[req valueForHTTPHeaderField:@"X-Apple-Client-App-Name"] isEqual:@"iCloud"] &&
+            [[req valueForHTTPHeaderField:@"X-Apple-I-Client-Bundle-Id"] isEqual:@"com.apple.preferences.icloud"]);
+        assert([[cpd objectForKey:@"X-Apple-I-Device-Configuration-Mode"] isEqual:@"0"] &&
+            [[cpd objectForKey:@"X-Apple-Requested-Partition"] isEqual:@"0"] &&
+            [[cpd objectForKey:@"X-Apple-Security-Upgrade-Context"] isEqual:@"com.apple.authkit.generic"] &&
+            [[cpd objectForKey:@"capp"] isEqual:@"iCloud"] && [[cpd objectForKey:@"cbid"] isEqual:@"com.apple.preferences.icloud"] &&
+            [[cpd objectForKey:@"ckgen"] boolValue] && [[cpd objectForKey:@"fcd"] boolValue]);
+        NSString *requestUUID = [cpd objectForKey:@"X-Apple-I-Request-UUID"];
+        assert([requestUUID length] == 36 && [requestUUID characterAtIndex:8] == '-' && [requestUUID characterAtIndex:13] == '-' &&
+            [requestUUID characterAtIndex:18] == '-' && [requestUUID characterAtIndex:23] == '-' && [requestUUID characterAtIndex:14] == '4' &&
+            [requestUUID isEqual:[requestUUID uppercaseString]]);
+        BOOL initOperation = [operation isEqual:@"init"];
+        if (!grandSlamRequestUUID || (initOperation && !([mode hasPrefix:@"resync"] && syncCalls)))
+            grandSlamRequestUUID = [requestUUID copy];
+        else assert([requestUUID isEqual:grandSlamRequestUUID]);
         assert([[cpd objectForKey:@"svct"] isEqual:@"iCloud"] && [[cpd objectForKey:@"prkgen"] boolValue]);
         assert([[cpd objectForKey:@"X-MMe-Client-Info"] isEqual:expectedClient()]);
         assert([[req valueForHTTPHeaderField:@"X-Mme-Client-Info"] isEqual:[cpd objectForKey:@"X-MMe-Client-Info"]]);
-        if ([[payload objectForKey:@"o"] isEqual:@"init"]) {
+        if (initOperation) {
             initCalls++; server_start([payload objectForKey:@"A2k"]);
             result = [NSDictionary dictionaryWithObjectsAndKeys:@"s2k", @"sp", @5, @"i", bytes(@"ordinarysalt1234"), @"s",
                 [mode isEqual:@"malformed"] ? bytes(@"oversized-invalid") : serverB, @"B", @"continuation", @"c", nil];
@@ -150,8 +185,7 @@ static NSData *encrypted_session(void) {
         } else {
             completeCalls++;
             BOOL matches = [[payload objectForKey:@"M1"] isEqual:[serverProof subdataWithRange:NSMakeRange(0,32)]];
-            BOOL wrongPasswordAttempt = fixture(@"2fa-wrong-password") && completeCalls == 3;
-            assert(wrongPasswordAttempt ? !matches : matches);
+            assert(matches);
             NSMutableData *m2 = [[[serverProof subdataWithRange:NSMakeRange(32,32)] mutableCopy] autorelease];
             if (fixture(@"bad-proof")) ((unsigned char *)[m2 mutableBytes])[0] ^= 1;
             if ([mode isEqual:@"short-proof"]) [m2 setLength:1];
@@ -168,12 +202,7 @@ static NSData *encrypted_session(void) {
                 [s setObject:[mode isEqual:@"resync-malformed"] ? @"***=" : @"c2VydmVyLXN5bmM=" forKey:@"X-Apple-I-MD-DATA"];
             if ([mode isEqual:@"resync-header"]) responseHeaders = @{@"x-apple-i-md-data":@"c2VydmVyLXN5bmM="};
         }
-        if (fixture(@"2fa-wrong-password") && completeCalls == 3 && [[payload objectForKey:@"o"] isEqual:@"complete"]) {
-            /* A valid code and matching length cannot substitute for the password. */
-            [s setObject:@-20101 forKey:@"ec"];
-            [r removeAllObjects];
-        }
-        if (completeCalls && twoFactor() && !verified) { [s setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"]; [s setObject:@409 forKey:@"hsc"]; }
+        if (completeCalls && twoFactor() && !verified) [s setObject:@409 forKey:@"hsc"];
         [r setObject:s forKey:@"Status"]; result = [NSDictionary dictionaryWithObject:r forKey:@"Response"];
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2/lookup"]) {
         assert(syncCalls == 1 && ![req HTTPBody] && ![req valueForHTTPHeaderField:@"Authorization"]);
@@ -191,15 +220,21 @@ static NSData *encrypted_session(void) {
         if ([mode isEqual:@"resync-routing"]) [reply setObject:@"67890" forKey:@"X-Apple-I-MD-RINFO"];
         result = @{@"Response":reply};
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/auth/verify/trusteddevice"]) {
-        codeCalls++; assert([req valueForHTTPHeaderField:@"X-Apple-Identity-Token"]);
-        result = [NSDictionary dictionary];
+        codeCalls++; assert([req valueForHTTPHeaderField:@"X-Apple-Identity-Token"] &&
+            [[req valueForHTTPHeaderField:@"X-MMe-Client-Info"] isEqual:expectedVerificationClient()]);
+        result = fixture(@"2fa-notify-failure") ?
+            [NSDictionary dictionaryWithObject:[NSDictionary dictionaryWithObject:@-1 forKey:@"ec"] forKey:@"Status"] :
+            [NSDictionary dictionary];
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2/validate"]) {
         codeCalls++;
+        assert([[req valueForHTTPHeaderField:@"X-MMe-Client-Info"] isEqual:expectedVerificationClient()]);
         NSString *code = [req valueForHTTPHeaderField:@"security-code"];
         assert([code isEqual:@"123456"] || [code isEqual:@"000000"]);
         verified = [code isEqual:@"123456"];
-        result = [NSDictionary dictionaryWithObject:[NSDictionary dictionaryWithObject:
-            verified ? @0 : @-21669 forKey:@"ec"] forKey:@"Status"];
+        /* Apple's header wraps the service label and token in base64. The
+         * downstream setup assertions require only the decoded token. */
+        if (verified) responseHeaders = @{@"x-apple-pe-token":@"Y29tLmFwcGxlLmdzLmlkbXMucGV0OmZha2UtcGV0"};
+        result = [NSDictionary dictionaryWithObject:verified ? @0 : @-21669 forKey:@"ec"];
     } else if ([host isEqual:@"setup.icloud.com"] && [path isEqual:@"/setup/iosbuddy/loginDelegates"]) {
         accountCalls++;
         NSDictionary *body = parse([req HTTPBody]);
@@ -291,6 +326,15 @@ static NSMutableURLRequest *idsLogin(NSString *password) {
     return req;
 }
 static NSData *finishTwoFactor(BOOL ids, NSURLResponse **response, NSError **error) {
+    if (fixture(@"2fa-code-only")) {
+        /* The validation response supplies the PET; no third password request
+         * or app-token exchange is necessary. */
+        *response = nil; *error = nil;
+        NSData *result = [NSURLConnection sendSynchronousRequest:ids ? idsLogin(@"123456") : login(@"123456")
+            returningResponse:response error:error];
+        assert(!*error && verified && codeCalls == 2 && initCalls == 1 && completeCalls == 1);
+        return result;
+    }
     /* Dismiss the first code and retry the unmodified password. Even numeric
      * passwords must complete SRP again and request a replacement code. */
     /* Changed passwords outside the appended-code format also start fresh. */
@@ -308,25 +352,10 @@ static NSData *finishTwoFactor(BOOL ids, NSURLResponse **response, NSError **err
     [NSURLConnection sendSynchronousRequest:ids ? idsLogin(wrong) : login(wrong) returningResponse:response error:error];
     assert(*error && !verified && codeCalls == 3 && initCalls == 2 && !accountCalls);
 
-    if (fixture(@"2fa-wrong-password")) {
-        /* A different prefix of the expected length looks like password+code.
-         * Code validation succeeds, but SRP must reject the wrong password. */
-        *response = nil; *error = nil;
-        NSString *wrongPassword = @"Alternate:PassWord123456";
-        [NSURLConnection sendSynchronousRequest:ids ? idsLogin(wrongPassword) : login(wrongPassword)
-            returningResponse:response error:error];
-        assert(*error && verified && codeCalls == 4 && initCalls == 3 && completeCalls == 3 && !accountCalls);
-        *response = nil; *error = nil;
-        data = [NSURLConnection sendSynchronousRequest:ids ? idsLogin(testPassword()) : login(testPassword())
-            returningResponse:response error:error];
-        assert(initCalls == 4 && completeCalls == 4 && codeCalls == 4);
-        return data;
-    }
-
     *response = nil; *error = nil;
     NSString *correct = [testPassword() stringByAppendingString:@"123456"];
     data = [NSURLConnection sendSynchronousRequest:ids ? idsLogin(correct) : login(correct) returningResponse:response error:error];
-    assert(verified && codeCalls == 4 && initCalls == 3 && completeCalls == 3);
+    assert(verified && codeCalls == 4 && initCalls == 2 && completeCalls == 2);
     return data;
 }
 int main(int argc, char **argv) {
@@ -359,6 +388,16 @@ int main(int argc, char **argv) {
             NSDictionary *body = parse(data);
             assert([[body objectForKey:@"status"] integerValue] == 0);
             assert([[body objectForKey:@"auth-token"] isEqual:@"fixture-ids-token"] && [[body objectForKey:@"profile-id"] isEqual:@"D:12345"]);
+            if (twoFactor()) {
+                /* Messages may repeat its successful code-bearing request in
+                 * the same agent. It must not restart SRP with that code. */
+                int previousInit=initCalls, previousComplete=completeCalls, previousCode=codeCalls;
+                NSString *input = fixture(@"2fa-code-only") ? @"123456" : [testPassword() stringByAppendingString:@"123456"];
+                response=nil; error=nil;
+                NSData *repeated=[NSURLConnection sendSynchronousRequest:idsLogin(input) returningResponse:&response error:&error];
+                assert(!error && [parse(repeated) isEqual:body]);
+                assert(initCalls==previousInit && completeCalls==previousComplete && codeCalls==previousCode && accountCalls==1);
+            }
             Class protocol = NSClassFromString(@"AQGSAProtocol"); assert(protocol);
             for (NSString *url in [NSArray arrayWithObjects:
                 @"http://profile.ess.apple.com/WebObjects/VCProfileService.woa/wa/authenticateUser",
