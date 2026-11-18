@@ -292,6 +292,9 @@ static OSStatus my_SSLHandshake(SSLContextRef c) {
     if (!tf_on()) return o_SSLHandshake(c);
     Shadow *s = sh_get(c);
     if (!s) return o_SSLHandshake(c);
+    // A live legacy AirDrop request must keep Mavericks' original TLS contract.
+    // Decide before any OpenSSL bytes are sent, and retain the choice per context.
+    if (!s->serverSide && !s->inited && tf_airdrop_native_peer(s->host)) s->clientBypass=1;
     OSStatus rv;
     if (!s->rf || !s->wf || !s->conn || s->clientBypass || (s->serverSide && (!server_tls_enabled() || s->serverBypass || !s->clientX509)) || s->state == SH_STATE_FAILED) { rv = o_SSLHandshake(c); goto done; }
     sh_unblock_write(s);   // an entry like any other; see bio_bwrite

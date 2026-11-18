@@ -27,6 +27,7 @@ rm -rf "$ST/airdrop/AirDropUI.bundle"
 ditto "$SOURCES/AirDropUI.bundle" "$ST/airdrop/AirDropUI.bundle"
 printf '_AQAirDropInstalled\n' > "$BUILD/exports.txt"
 printf '_AQAirDropModernActive\n' >> "$BUILD/exports.txt"
+printf '_AQAirDropNativePeer\n' >> "$BUILD/exports.txt"
 FLAGS=(-arch x86_64 -mmacosx-version-min=10.9 -O2 -fobjc-arc -fblocks -fvisibility=hidden -Wall -Wextra)
 clang "${FLAGS[@]}" -dynamiclib "$SOURCES/AQAirDrop.m" "$SOURCES/AQUI.m" "$DIR/deps/fishhook/fishhook.c" \
   -framework Foundation -framework CFNetwork -framework AppKit -framework IOBluetooth -framework CoreWLAN -Wl,-exported_symbols_list,"$BUILD/exports.txt" \

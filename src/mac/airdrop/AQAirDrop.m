@@ -69,6 +69,7 @@ static BOOL wifi_powered(void) { return [CWInterface interface].powerOn; }
 #include "AQRadio.inc"
 #include "AQTransferLease.inc"
 #include "AQServerDrain.inc"
+#include "AQServerRestart.inc"
 static BOOL is_airdrop_browser(id browser) {
     return *((const unsigned char *)(__bridge const void *)browser+browser_airdrop_offset)!=0;
 }
@@ -133,6 +134,17 @@ static NSDictionary *capabilities(void) {
     return @{@"ReceiverComputerName":[[NSHost currentHost] localizedName] ?: @"Mac",@"ReceiverModelName":model[0] ? [NSString stringWithUTF8String:model] : @"Mac",@"ReceiverMediaCapabilities":[@"{\"Version\":1}" dataUsingEncoding:NSUTF8StringEncoding]};
 }
 #include "AQOutgoing.inc"
+#include "AQLegacyDH.h"
+static void (*original_dh_settings)(id,SEL,id);
+static CFStringRef http_stream_ssl_settings,stream_dh_params;
+static void dh_settings(id server,SEL selector,NSMutableDictionary *settings) {
+    original_dh_settings(server,selector,settings);
+    if(!native_mode) return;
+    NSString *key=(__bridge NSString *)http_stream_ssl_settings;
+    NSMutableDictionary *stream=[settings[key] mutableCopy] ?: [NSMutableDictionary dictionary];
+    stream[(__bridge NSString *)stream_dh_params]=[NSData dataWithBytes:legacy_dh_params length:sizeof(legacy_dh_params)];
+    settings[key]=stream;
+}
 static CFTypeRef response(AQRequest request,CFHTTPMessageRef message,CFDataRef body) {
     if(!native_mode && CFHTTPMessageGetResponseStatusCode(message)==200 && [[path_for_request(request) lastPathComponent] isEqual:@"Ask"] && body) {
         // The native offer/acceptance state belongs to this HTTP connection.
@@ -162,9 +174,12 @@ static void received_request(id connection,SEL selector,AQRequest request) {
     original_request(connection,selector,request);
 }
 static void start_server(id server,SEL selector) {
-    prepare_server_drain(server);
     [active_servers addObject:server];
-    if(native_mode) { original_start(server,selector); return; }
+    if(native_mode) {
+        original_start(server,selector);
+        if(*(void **)((char *)(__bridge void *)server+server_http_offset)) prepare_server_drain(server);
+        return;
+    }
     if(!acquire_radio(server)) {
         [pending_servers addObject:server];
         NSLog(wifi_powered() ? @"AquaTransport AirDrop: radio unavailable" : @"AquaTransport AirDrop: waiting for Wi-Fi to be turned on");
@@ -178,8 +193,11 @@ static void start_server(id server,SEL selector) {
     [pending_servers removeObject:server];
     resume_transfer_server(server);
     original_start(server,selector);
+    // A refused start must not cancel cleanup of the previous listener.
+    if(*(void **)((char *)(__bridge void *)server+server_http_offset)) prepare_server_drain(server);
 }
 static void stop_server(id server,SEL selector) {
+    cancel_server_restart(server);
     [active_servers removeObject:server];
     [pending_servers removeObject:server];
     if(native_mode) { original_stop(server,selector); return; }
@@ -215,13 +233,22 @@ __attribute__((constructor)) static void install_airdrop(void) { @autoreleasepoo
     if(!transfer_begin || !transfer_end || !transfer_notify || !receive_notify || !receive_end || !receive_ask || strcmp(ivar_getTypeEncoding(receive_ask),"^{_CFHTTPServerRequest=}")) return;
     receive_ask_offset=ivar_getOffset(receive_ask);
     Method start=checked_method(@"SDWormholeServer","startHTTPServer","v16@0:8"),stop=checked_method(@"SDWormholeServer","stop","v16@0:8");
+    Method dh=checked_method(@"SDWormholeServer","setDiffieHellmanParams:","v24@0:8@16");
+    CFStringRef *http_ssl=dlsym(RTLD_DEFAULT,"_kCFHTTPServerStreamSSLSettings");
+    CFStringRef *dh_params=dlsym(RTLD_DEFAULT,"kCFStreamSocketSecurityLevelDiffieHellmanParams");
+    if(!dh || !http_ssl || !dh_params) return;
+    http_stream_ssl_settings=*http_ssl; stream_dh_params=*dh_params;
     Class server_class=NSClassFromString(@"SDWormholeServer");
     Ivar server_http=class_getInstanceVariable(server_class,"_server"),server_connections=class_getInstanceVariable(server_class,"_connections");
+    Ivar server_publisher=class_getInstanceVariable(server_class,"_publisher");
     server_queue_ivar=class_getInstanceVariable(server_class,"_queue");
     if(!server_http || strcmp(ivar_getTypeEncoding(server_http),"^{_CFHTTPServer=}") ||
        !server_connections || strcmp(ivar_getTypeEncoding(server_connections),"^{__CFDictionary=}") ||
-       !server_queue_ivar || strcmp(ivar_getTypeEncoding(server_queue_ivar),"@\"NSObject<OS_dispatch_queue>\"")) return;
+       !server_queue_ivar || strcmp(ivar_getTypeEncoding(server_queue_ivar),"@\"NSObject<OS_dispatch_queue>\"") ||
+       !server_publisher || strcmp(ivar_getTypeEncoding(server_publisher),"@\"SDBonjourPublisher\"") ||
+       !checked_method(@"SDWormholeServer","start","v16@0:8")) return;
     server_http_offset=ivar_getOffset(server_http); server_connections_offset=ivar_getOffset(server_connections);
+    server_publisher_offset=ivar_getOffset(server_publisher);
     Method request=checked_method(@"SDWormholeConnection","didReceiveRequest:","v24@0:8^{_CFHTTPServerRequest=}16");
     Method offer_event=checked_method(@"SDWormholeConnection","handleReadStreamEvent:event:","v32@0:8^{__CFReadStream=}16Q24");
     if(!offer_event) return;
@@ -255,6 +282,7 @@ __attribute__((constructor)) static void install_airdrop(void) { @autoreleasepoo
     RESOLVE(tf_socket_providers,original_connect,"connect"); RESOLVE(tf_socket_providers,original_connectx,"connectx");
     RESOLVE(tf_cfnetwork_providers,original_create_connection,"CFURLConnectionCreateWithProperties");
     RESOLVE(tf_cfnetwork_providers,copy_mutable_request,"CFURLRequestCreateMutableCopy");
+    RESOLVE(tf_cfnetwork_providers,request_get_url,"CFURLRequestGetURL");
     RESOLVE(tf_cfnetwork_providers,set_request_header,"CFURLRequestSetHTTPHeaderFieldValue");
     RESOLVE(tf_cfnetwork_providers,response_message,"CFURLResponseGetHTTPResponse");
     RESOLVE(tf_cfnetwork_providers,server_connection_invalidate,"_CFHTTPServerConnectionInvalidate");
@@ -310,7 +338,9 @@ __attribute__((constructor)) static void install_airdrop(void) { @autoreleasepoo
     original_ask_body=(void *)method_setImplementation(ask,(IMP)ask_body);
     original_send_request=(void *)method_setImplementation(send,(IMP)send_request);
     original_received_response=(void *)method_setImplementation(gotResponse,(IMP)received_response);
+    original_dh_settings=(void *)method_setImplementation(dh,(IMP)dh_settings);
     adapter_installed=1;
+    install_server_restart_observer();
     install_mode_observer();
     NSLog(@"AquaTransport AirDrop: native daemon transport adapter installed");
 } }

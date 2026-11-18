@@ -23,7 +23,9 @@ static void (*native_cache_limit)(int,int);
 static pthread_once_t load_once=PTHREAD_ONCE_INIT;
 static int adapter_active;
 static int (*modern_active)(void);
+static int (*native_peer)(const char *);
 int tf_airdrop_active(void) { return adapter_active && (!modern_active || modern_active()); }
+int tf_airdrop_native_peer(const char *host) { return adapter_active && native_peer && native_peer(host); }
 static int tap_available(void) { struct stat st; return !lstat("/dev/tap0",&st) && S_ISCHR(st.st_mode); }
 static int trusted_file(const char *path) {
     struct stat st; char parent[1024];
@@ -92,6 +94,7 @@ static void load_adapter(void) {
     if(module) {
         int (*installed)(void)=dlsym(module,"AQAirDropInstalled");
         modern_active=dlsym(module,"AQAirDropModernActive");
+        native_peer=dlsym(module,"AQAirDropNativePeer");
         adapter_active=installed && installed();
         tf_log("AirDrop adapter loaded, %s",adapter_active ? "active" : "inactive");
     }

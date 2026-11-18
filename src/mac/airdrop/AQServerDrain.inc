@@ -16,6 +16,7 @@ static char server_drain_key;
 @interface AQServerDrainState : NSObject
 @property(weak) id server;
 @property NSUInteger generation;
+@property NSUInteger scheduledGeneration;
 @end
 @implementation AQServerDrainState
 @end
@@ -61,5 +62,8 @@ static void drain_server(AQServerDrainState *state,NSUInteger generation,NSUInte
 }
 static void drain_after_stop(id server) {
     AQServerDrainState *state=objc_getAssociatedObject(server,&server_drain_key);
-    if(state) drain_server(state,state.generation,0);
+    if(state && state.scheduledGeneration!=state.generation) {
+        state.scheduledGeneration=state.generation;
+        drain_server(state,state.generation,0);
+    }
 }

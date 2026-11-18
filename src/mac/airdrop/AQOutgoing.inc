@@ -7,6 +7,8 @@ static const void *(*original_create_connection)(CFAllocatorRef,const void *,con
 static const void *(*copy_mutable_request)(CFAllocatorRef,const void *);
 static void (*set_request_header)(const void *,CFStringRef,CFStringRef);
 static CFHTTPMessageRef (*response_message)(const void *);
+static CFURLRef (*request_get_url)(const void *);
+#include "AQLegacyTLS.inc"
 static __thread void *outgoing_client;
 static char transfer_key;
 static NSString *transfer_id(id client) {
@@ -31,13 +33,16 @@ static NSData *ask_body(id client,SEL selector,NSInteger format) {
     return [NSPropertyListSerialization dataWithPropertyList:fields format:(NSPropertyListFormat)format options:0 error:NULL] ?: native;
 }
 static void send_request(id client,SEL selector,CFStringRef operation) {
-    if(AQ_NATIVE_MODE) { original_send_request(client,selector,operation); return; }
     void *previous=outgoing_client; outgoing_client=(__bridge void *)client;
     @try { original_send_request(client,selector,operation); } @finally { outgoing_client=previous; }
 }
 static const void *create_connection(CFAllocatorRef allocator,const void *request,const void *callbacks,CFDictionaryRef nativeProperties) {
-    if(AQ_NATIVE_MODE || !outgoing_client) return original_create_connection(allocator,request,callbacks,nativeProperties);
+    if(!outgoing_client) return original_create_connection(allocator,request,callbacks,nativeProperties);
     id client=(__bridge id)outgoing_client;
+    if(AQ_NATIVE_MODE) {
+        remember_legacy_peer(client,request_get_url(request));
+        return original_create_connection(allocator,request,callbacks,nativeProperties);
+    }
     const void *modified=copy_mutable_request(allocator,request);
     if(!modified) return original_create_connection(allocator,request,callbacks,nativeProperties);
     set_request_header(modified,CFSTR("TransferID"),(__bridge CFStringRef)transfer_id(client));

@@ -32,7 +32,7 @@ static void apply_pending_mode(void) {
             }
             if(next) force_stop_radio();
             native_mode=(BOOL)next;
-            for(id server in servers) start_server(server,@selector(startHTTPServer));
+            for(id server in servers) restart_server(server);
             for(id browser in browsers) start_browser(browser,@selector(start));
             [[NSDistributedNotificationCenter defaultCenter] postNotificationName:AQModeChanged
                 object:@"org.aquatransport.airdrop" userInfo:@{@"native":@(native_mode)}
