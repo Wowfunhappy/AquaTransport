@@ -48,18 +48,6 @@ retries the interrupted GrandSlam operation once. A repeated challenge, malforme
 server message, native failure, invalid URL, rejected sync or routing persistence
 failure stops without another retry. No account credential enters this repair path.
 
-**Isolated native identity (adapter 13, 2026-11-05):** A field report showed a
-previously working Mavericks CoreADI identity returning `434/-22421` for both a
-synthetic and real account. Apple accepted `midSyncMachine` but continued to reject
-the identity. AquaTransport now provisions its own native identity in a private
-per-user store instead of sharing `/Users/Shared/adi` with legacy Apple clients.
-The installed system CoreADI framework is mapped directly; copy-on-write import
-slots redirect only the helper process, so no Apple binary is copied, distributed,
-downloaded or modified. The private backend was validated end to end:
-anonymous provisioning completed and Apple answered a synthetic-account `init`
-with `hsc 200 / ec -20970`, both in the standalone prototype and through the
-installed helper. Existing system ADI files are not read, reset, moved or deleted.
-
 ## Build
 
 The module needs a compiler that supports Objective-C garbage collection. Mavericks
@@ -106,18 +94,12 @@ outstanding.
 ## Local Anisette generation
 
 GrandSlam needs fresh device authentication data as well as SRP. The only generator
-is Apple's locally installed CoreADI, called by the bundled
+is Apple's installed AOSKit/CoreADI, called by the bundled
 `aquatransport-anisette` helper. Its job plist lives at
 `/usr/share/aquatransport/org.aquatransport.anisette.plist`. The existing
 `aquatransport-bootstrap` registers it on Lion and later, unless iCloud support
 is disabled, using the same lifecycle as the AirDrop feature job. No additional
 job is installed in `/Library/LaunchAgents` or `/Library/LaunchDaemons`.
-On x86_64 Mavericks 10.9.5, the helper maps the Mac's installed
-`CoreADI.framework/CoreADI` binary and validates its expected Mach-O UUID and
-import layout before using it. Its imported filesystem and host-UUID calls are
-redirected through copy-on-write slots inside the unprivileged worker to the
-private AquaTransport identity. Other OS versions and 32-bit-only workers keep
-the earlier AOSKit backend. An unsupported or changed binary fails closed.
 
 All clients use `/var/run/org.aquatransport.anisette.sock`. Clients verify the
 server's root identity. The broker obtains each client's user ID from the kernel
@@ -131,7 +113,7 @@ no TCP listener, remote provider, provider URL setting, downloaded runtime, or
 alternate generation path. Failure stops authentication.
 
 The separate process is necessary on Mavericks: the running Mail, Calendar and
-CalendarAgent sandboxes deny access to device state and to
+CalendarAgent sandboxes deny access to Apple's `/Users/Shared/adi` state and to
 the adapter's metadata directory. Generation runs as the requesting user and
 requires no sandbox changes. Launchd starts the broker only when a client uses
 the socket. Each worker handles one request; the broker exits after 30 idle
@@ -149,35 +131,28 @@ flowchart LR
     Client -->|"Account authentication"| Apple
 ```
 
-On first use, if the private native state check specifically returns `-45061` (not
+On first use, if the native state check specifically returns `-45061` (not
 provisioned), the helper performs a single lookup/start/finish exchange directly
 with `gsa.apple.com`: at most three HTTPS requests, no redirects or automatic
 retries, 30 seconds per request. Apple's native routines create and finish the
 cryptographic challenge and retain the resulting ADI state. Each user's metadata
 file is locked across processes, and a failed attempt imposes a 24-hour cooldown.
-Unknown native errors do not trigger provisioning. Existing system native state is
-never reset or copied. A random private device/host UUID is generated once and saved
-with its routing metadata; no account identifier is involved in provisioning.
+Unknown native errors do not trigger provisioning. Existing native state is never
+reset or copied from another device.
 
 The obsolete `/usr/share/aquatransport/config/gsa-anisette-url.txt` file is no longer
 read. A file left by an older installation has no effect and can be removed. The
 library must be rebuilt and installed, and affected processes restarted, for this
 change to apply; a source checkout does not change an already loaded library.
 
-The private backend uses its saved random UUID consistently as CoreADI's host UUID,
-`X-Mme-Device-Id`, and the basis for `X-Apple-I-MD-LU`. Mavericks lacks
-`machineUDID`, and its 32-bit Objective-C OTP wrapper truncates
-the `-2` provisioning identifier. On Mavericks x86_64 the helper maps the installed
-CoreADI image, validates its native ABI, discovers its encoded import slots by
-comparing the loaded and on-disk Mach-O slices, verifies each resolved API by its
-system provider and symbol rather than its process address, and redirects those
-slots through process-private copy-on-write pages. It does not depend on one Mac's
-dyld pathname, shared-cache layout, offsets or encoding addends. The legacy
-fallback calls the
-named native AOSKit wrappers with a full `uint64_t`; its resolver checks symbol and
-segment bounds and accepts only defined executable addresses. Unsupported or
-stripped frameworks fail closed; private native compatibility has been tested on
-10.9.5, not 10.7 or 10.8.
+The adapter reads `IOPlatformUUID` through IOKit for its stable device identity.
+Mavericks lacks `machineUDID`, and its 32-bit Objective-C OTP wrapper truncates
+the `-2` provisioning identifier. The generator calls the named native AOSKit
+wrappers with a full `uint64_t` on both architectures. Those wrappers are local
+Mach-O symbols: the resolver checks the installed framework's symbol and segment
+bounds and accepts only defined executable addresses. It neither patches Apple's
+framework nor uses hardcoded addresses. Unsupported or stripped frameworks fail
+closed; native compatibility has been tested on 10.9.5, not 10.7 or 10.8.
 Native `X-Apple-MD` and `X-Apple-MD-M` become
 `X-Apple-I-MD` and `X-Apple-I-MD-M`; missing, empty, malformed or oversized values
 are rejected. The local identity is the base64-encoded hardware UUID, routing
@@ -217,13 +192,13 @@ started a new broker and successfully generated native headers. The rebuilt
 installer contains the feature plist under `/usr/share/aquatransport` and no
 Anisette LaunchAgent.
 
-`~/Library/Application Support/AquaTransport/anisette-private.plist` contains the
-private device UUID, routing value and last attempt time, with directory mode 0700
-and file mode 0600. CoreADI state is below the separately protected
-`CoreADI-private` directory. Routing is saved before committing newly provisioned
-state and is also recorded through CoreADI's native routing operation. Do not delete
-or copy these files to retry sign-in. Existing legacy metadata in `anisette.plist`
-and `/Users/Shared/adi` is preserved for rollback and other Apple software.
+`~/Library/Application Support/AquaTransport/anisette.plist` contains the hardware
+UUID, routing value and last attempt time, with directory mode 0700 and file mode
+0600. Routing is saved before committing newly provisioned native state. The
+Apple ADI blobs are not copied into this file. Do not delete this metadata to
+retry sign-in: already provisioned state with missing routing fails explicitly
+instead of guessing routing or replacing Apple's state. This also applies when
+another user or application provisioned the machine without this metadata.
 
 The offline `build/gsa-diagnose --record-routing VALUE` recovery operation can
 record a value retained from a successful provisioning response, provided native
@@ -243,14 +218,9 @@ number to the returned `midSyncMachine` URL. Both URLs must be HTTPS on exactly
 
 After an `ec 0` response, any returned routing value is validated and stored under
 the same per-user lock. The failed `init` or `complete` operation is retried once
-with a newly generated OTP. Mavericks CoreADI can return the same OTP again within
-its 30-second time window; if so, the adapter waits only until the next boundary,
-generates again, and verifies that the value advanced before retrying. This bound
-prevents a repeated server challenge from creating a request loop. One uppercase
-v4 `X-Apple-I-Request-UUID` is generated per login and retained across `init`,
-resynchronization, the retry and `complete`, matching GrandSlam's request-correlation
-contract. The original password, SRP proof, verification code and service tokens
-never cross the helper IPC or enter the synchronization request.
+with a newly generated OTP. This bound prevents a repeated server challenge from
+creating a request loop. The original password, SRP proof, verification code and
+service tokens never cross the helper IPC or enter the synchronization request.
 
 ## Install and try a sign-in
 
@@ -278,49 +248,33 @@ to `434/-22421`; deleting either can make the existing machine state unrecoverab
 For trusted-device two-factor authentication, the first attempt requests a code and
 returns an authentication failure to the old client. Approve the request on the
 trusted device, then retry within five minutes using **your password immediately
-followed by the six-digit code**. Keep the same preference pane/helper process
-running between attempts. A six-digit code entered by itself is also accepted; it
-validates the pending session without retaining or re-entering the password. If you
-dismiss or miss the code, retry with just your password to request another one, even
-if your password ends in six or more digits. An appended code is recognized only
-when the input is exactly six characters longer than the original password and ends
-in six ASCII digits. Length and slicing both use NSString's UTF-16 code units, so
-Unicode passwords follow the same rule.
+followed by the six-digit code**. A code by itself is not supported. Keep the same
+preference pane/helper process running between attempts. If you dismiss or miss the
+code, retry with just your password to request another one, even if your password
+ends in six or more digits. An appended code is recognized only when the input is
+exactly six characters longer than the original password and ends in six ASCII
+digits. Length and slicing both use NSString's UTF-16 code units, so Unicode
+passwords follow the same rule.
 
-Length is only a format hint for extracting an appended code; the initial SRP
-exchange has already proved the password. AquaTransport checks the top-level
-`ec` in the validation response and takes the password-equivalent token from
-`X-Apple-PE-Token` by base64-decoding its `com.apple.gs.idms.pet:<token>`
-envelope and extracting the token after the validated service label. A missing
-or malformed success status, rejected code, malformed token envelope, or
-missing token stops authentication. No additional SRP or `apptokens` exchange
-is needed for this flow.
+Length is only a format hint: a different password exactly six characters longer
+and ending in six digits can be mistaken for password-plus-code while verification
+is pending. Apple must validate the code and then the password through SRP before
+sign-in succeeds. If you changed your password into that shape, wait for the pending
+session to expire or restart the preference pane/helper process before retrying.
 
-Pending state stores the verification session, password length and expiration
-time. No password fingerprint or plaintext password is retained in pending state.
+Pending state stores the verification session, password length, and expiration time.
+No password fingerprint or plaintext password is retained in pending state.
 The state is bounded to 32 accounts per process and expires after five minutes;
 expired records are removed on the next attempt. Expiration limits validity, not
 memory retention: an idle process can retain an expired record until its next
 attempt or process exit. Removing a record does not guarantee its memory is erased.
 
 The old pane may show a generic authentication failure rather than instructions for
-entering the code. The user completed this two-attempt flow with a real account.
-Automatic SMS-number selection and delivery, account recovery, account creation,
-terms acceptance, Game Center and full Find My support are not implemented. A code
-can instead be obtained manually from a trusted device or phone number. The
-experimental iMessage profile adapter is described below; native iMessage sign-in
-is user-confirmed on Mavericks. This module does not guarantee that iCloud services
-work after account creation.
-
-Current GrandSlam responses place the secondary-auth method inside the encrypted
-session dictionary; older responses placed it in the outer status dictionary.
-AquaTransport accepts both layouts. After the server proof and encrypted session
-are authenticated, `hsc 409` preserves the verification session even if `au` is
-absent or unfamiliar. Every authenticated 409 requests Apple's normal
-trusted-device approval prompt; failure of that request still leaves manual code
-entry available. The ordinary system log records the bounded printable method
-value, or `absent`, after the server proof and encrypted session are verified; it
-does not log the verification token or code.
+entering the code. The user completed this two-attempt flow with a real account. SMS-only
+verification (`secondaryAuth`), account recovery, account creation, terms acceptance,
+Game Center and full Find My support are not implemented. The experimental iMessage profile
+adapter is described below; native iMessage sign-in is user-confirmed on Mavericks. This module does not
+guarantee that iCloud services work after account creation.
 
 On Mavericks, a narrow Find My compatibility fix adds a missing top-level
 `"positionType": ""` to JSON POST bodies at
@@ -414,15 +368,7 @@ only `com.apple.madrid`. It supplies the username/PET, device headers and
 `service-data` must contain nonempty `profile-id` and `auth-token` strings. Only then
 are those server-issued credentials translated into the profile response expected
 by Mavericks. Failed or malformed replies never become successful activation.
-There is no fallback request to `authenticateUser`. Adapter 15 retains the last
-successful delegate response in process memory for up to 60 seconds to handle
-Messages repeating its successful verification request. Matching covers the
-decoded request body (including account and input), exact URL, client ID and
-protocol version using HMAC-SHA256 with a random per-record key. Changed input
-invalidates the record; expiry uses monotonic system uptime and is checked on
-lookup. No plaintext password/code is stored in the record, and failed delegate
-responses are never cached. An idle process may retain the expired reply until
-its next lookup or exit; nothing is persisted to disk.
+There is no fallback request to `authenticateUser`, and no token caching/replay.
 The existing `disable-icloud-gsa` flag also disables this adapter.
 
 The PET-to-delegate exchange is independently implemented with reference to
@@ -556,11 +502,8 @@ The exchange uses SRP-6a with the RFC 5054 2048-bit group, SHA-256 and Apple's
 server public values, verifies the exact-length M2 proof with a constant-time
 comparison, and only then decrypts the session data using AES-256-CBC. Group
 integers in the session key and proof hashes retain the full 256-byte group width,
-matching CoreCrypto's SRP6a_HASH variant. The five machine-proof fields are repeated
-unchanged in the GrandSlam client-data plist and HTTP envelope, matching current
-`akd`; the request also carries the full iCloud AuthKit context. Its User-Agent is
-built from the installed CFNetwork version and Darwin release rather than a pinned
-newer OS. Secret
+matching CoreCrypto's SRP6a_HASH variant. The OTP is included in the GrandSlam
+client-data plist, not duplicated in that exchange's HTTP headers. Secret
 exponents and C key buffers are cleared when released. Foundation strings/data used
 during an attempt are transient, but their storage cannot be guaranteed erased.
 

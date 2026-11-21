@@ -27,7 +27,7 @@ sudo pkgutil --forget Wowfunhappy.AquaTransport
 # Tap Kext
 sudo launchctl unload /Library/LaunchDaemons/net.sf.tuntaposx.tap.plist
 sudo rm -f /Library/LaunchDaemons/net.sf.tuntaposx.tap.plist
-sudo rm -f /Library/Extensions/tap.kext
+sudo rm -rf /Library/Extensions/tap.kext
 sudo pkgutil --forget net.sf.tuntaposx.tap
 
 sudo update_dyld_shared_cache

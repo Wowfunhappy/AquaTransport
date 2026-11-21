@@ -8,12 +8,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-/* Compile-time override for the isolated offline replay harness only. */
-#ifndef AQ_NATIVE_FRAMEWORK_PATH
-#define AQ_NATIVE_FRAMEWORK_PATH "/System/Library/PrivateFrameworks/AOSKit.framework/AOSKit"
-#define AQ_NATIVE_FRAMEWORK_PREFIX "/System/Library/PrivateFrameworks/AOSKit.framework/"
-#endif
-
 static struct {
     int (*otp)(uint64_t, void **, uint32_t *, void **, uint32_t *);
     int (*sync)(uint64_t, const void *, uint32_t, void **, uint32_t *, void **, uint32_t *);
@@ -23,9 +17,6 @@ static struct {
     int (*dispose)(void *);
     int (*state)(uint64_t);
 } AQADI;
-#if defined(AQ_PRIVATE_BACKEND) && __LP64__
-#include "aquatransport_private_adi.inc"
-#endif
 
 /* These named AOSKit wrappers have identical ABIs in both Intel slices.
  * They are local Mach-O symbols, so dlsym cannot retrieve them. Resolve only
@@ -34,7 +25,7 @@ static struct {
 static void *aq_adi_symbol(const char *wanted) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *path = _dyld_get_image_name(i);
-        const char *prefix = AQ_NATIVE_FRAMEWORK_PREFIX;
+        const char *prefix = "/System/Library/PrivateFrameworks/AOSKit.framework/";
         if (!path || strncmp(path, prefix, strlen(prefix))) continue;
         const struct mach_header *h = _dyld_get_image_header(i);
         if (h->magic != MH_MAGIC && h->magic != MH_MAGIC_64) return NULL;
@@ -87,7 +78,7 @@ static void *aq_adi_symbol(const char *wanted) {
 
 static BOOL aq_adi_load(void) {
     static void *framework;
-    if (!framework) framework = dlopen(AQ_NATIVE_FRAMEWORK_PATH, RTLD_LAZY | RTLD_LOCAL);
+    if (!framework) framework = dlopen("/System/Library/PrivateFrameworks/AOSKit.framework/AOSKit", RTLD_LAZY | RTLD_LOCAL);
     if (!framework) return NO;
     /* Trigger +initialize, without the broken 32-bit DSID conversion in
      * retrieveOTPHeadersForDSID:. Always pass the full uint64_t -2 below. */
@@ -112,12 +103,12 @@ static NSString *aq_adi_routing(id value) {
     return s;
 }
 
-static int aq_adi_lock_named(NSString *name,NSError **error) {
+static int aq_adi_lock(NSError **error) {
     NSString *directory = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/AquaTransport"];
     struct stat st;
     if (mkdir([directory fileSystemRepresentation], 0700) && errno != EEXIST) goto failed;
     if (lstat([directory fileSystemRepresentation], &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077)) goto failed;
-    NSString *path = [directory stringByAppendingPathComponent:name];
+    NSString *path = [directory stringByAppendingPathComponent:@"anisette.plist"];
     int fd = open([path fileSystemRepresentation], O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) goto failed;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1 || (st.st_mode & 077) || st.st_size > 4096) { close(fd); goto failed; }
@@ -128,7 +119,6 @@ static int aq_adi_lock_named(NSString *name,NSError **error) {
 failed:
     *error = aq_error(14, @"Cannot securely open local device authentication metadata."); return -1;
 }
-static int aq_adi_lock(NSError **error) {return aq_adi_lock_named(@"anisette.plist",error);}
 static NSMutableDictionary *aq_adi_read(int fd) {
     unsigned char data[4096]; ssize_t n = pread(fd, data, sizeof data, 0);
     NSDictionary *d = n > 0 ? aq_plist([NSData dataWithBytes:data length:n]) : nil;
@@ -278,21 +268,8 @@ static BOOL aq_adi_store_routing(NSString *routing, NSString *device, int fd, NS
 @implementation AQNativeAnisetteGenerator
 + (NSDictionary *)headersForOwner:(AQGSAProtocol *)owner error:(NSError **)error {
     @synchronized(self) {
-#if defined(AQ_PRIVATE_BACKEND) && __LP64__
-      if(aq_private_preferred()) {
-        int fd=aq_adi_lock_named(AQ_PRIVATE_METADATA,error);if(fd<0)return nil;
-        NSMutableDictionary *record=aq_adi_read(fd);NSString *device=aq_device_field([record objectForKey:@"device"]);
-        if(!device){CFUUIDRef u=CFUUIDCreate(NULL);CFStringRef s=u?CFUUIDCreateString(NULL,u):NULL;if(u)CFRelease(u);device=s?[[[(NSString*)s uppercaseString]copy]autorelease]:nil;if(s)CFRelease(s);}
-        if (!aq_private_load(device, error)) {
-            flock(fd, LOCK_UN); close(fd);
-            if (!*error) *error = aq_error(10, @"Private native device authentication is unavailable.");
-            return nil;
-        }
-        @try{return aq_adi_headers(owner,device,fd,error);}@finally{flock(fd,LOCK_UN);close(fd);}
-      }
-#endif
         if (!aq_adi_load()) { *error = aq_error(10, @"This Apple framework does not expose the required native device authentication routines."); return nil; }
-        if (!aq_client_info() || !aq_akd_user_agent()) { *error = aq_error(13, @"This Mac has no usable model or system version."); return nil; }
+        if (!aq_client_info()) { *error = aq_error(13, @"This Mac has no usable model or system version."); return nil; }
         NSString *device = aq_device_field(aq_device_uuid());
         if (!device) { *error = aq_error(13, @"This Mac has no hardware UUID."); return nil; }
         int fd = aq_adi_lock(error); if (fd < 0) return nil;
@@ -302,18 +279,6 @@ static BOOL aq_adi_store_routing(NSString *routing, NSString *device, int fd, NS
 }
 + (NSDictionary *)synchronizeServerData:(NSData *)server owner:(AQGSAProtocol *)owner error:(NSError **)error {
     @synchronized(self) {
-#if defined(AQ_PRIVATE_BACKEND) && __LP64__
-      if(aq_private_preferred()) {
-        int fd=aq_adi_lock_named(AQ_PRIVATE_METADATA,error);if(fd<0)return nil;NSMutableDictionary *record=aq_adi_read(fd);NSString *device=aq_device_field([record objectForKey:@"device"]);
-        if (!device || !aq_private_load(device, error)) {
-            flock(fd, LOCK_UN); close(fd);
-            if (!*error) *error = aq_error(10, @"Private native device authentication is unavailable.");
-            return nil;
-        }
-        @try { return aq_adi_synchronize(server, device, fd, error); }
-        @finally { flock(fd, LOCK_UN); close(fd); }
-      }
-#endif
         if (!aq_adi_load()) { *error = aq_error(10, @"This Apple framework does not expose the required native device authentication routines."); return nil; }
         NSString *device = aq_device_field(aq_device_uuid());
         if (!device) { *error = aq_error(13, @"This Mac has no hardware UUID."); return nil; }
@@ -324,18 +289,6 @@ static BOOL aq_adi_store_routing(NSString *routing, NSString *device, int fd, NS
 }
 + (BOOL)storeRouting:(NSString *)routing owner:(AQGSAProtocol *)owner error:(NSError **)error {
     @synchronized(self) {
-#if defined(AQ_PRIVATE_BACKEND) && __LP64__
-      if(aq_private_preferred()) {
-        int fd=aq_adi_lock_named(AQ_PRIVATE_METADATA,error);if(fd<0)return NO;NSMutableDictionary *record=aq_adi_read(fd);NSString *device=aq_device_field([record objectForKey:@"device"]);
-        if (!device || !aq_private_load(device, error)) {
-            flock(fd, LOCK_UN); close(fd);
-            if (!*error) *error = aq_error(10, @"Private native device authentication is unavailable.");
-            return NO;
-        }
-        @try { return aq_adi_store_routing(routing, device, fd, error); }
-        @finally { flock(fd, LOCK_UN); close(fd); }
-      }
-#endif
         if (!aq_adi_load()) { *error = aq_error(10, @"This Apple framework does not expose the required native device authentication routines."); return NO; }
         NSString *device = aq_device_field(aq_device_uuid());
         if (!device) { *error = aq_error(13, @"This Mac has no hardware UUID."); return NO; }

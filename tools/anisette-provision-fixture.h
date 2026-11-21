@@ -35,7 +35,6 @@ static int fakeSync(uint64_t dsid, const void *server, uint32_t length, void **m
     assert(adiRequests <= 3 && aq_adi_url([[req URL] absoluteString]));
     assert(![req valueForHTTPHeaderField:@"Authorization"] && ![req valueForHTTPHeaderField:@"X-Apple-I-MD"]);
     assert([[req valueForHTTPHeaderField:@"X-Mme-Client-Info"] isEqual:aq_client_info()]);
-    assert([[req valueForHTTPHeaderField:@"User-Agent"] isEqual:aq_akd_user_agent()]);
     NSDictionary *result = nil; NSInteger status = 200;
     switch (adiRequests) {
         case 1:

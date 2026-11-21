@@ -58,7 +58,7 @@ static NSString *aq_device_field(id value) {
 static NSMutableURLRequest *aq_apple_request(NSString *url, NSDictionary *headers) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
     [req setValue:@"text/x-xml-plist" forHTTPHeaderField:@"Accept"];
-    [req setValue:aq_akd_user_agent() forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0" forHTTPHeaderField:@"User-Agent"];
     [req setValue:aq_client_info() forHTTPHeaderField:@"X-Mme-Client-Info"];
     for (NSString *key in headers) [req setValue:[headers objectForKey:key] forHTTPHeaderField:key];
     return req;
@@ -109,7 +109,6 @@ static NSData *aq_send(AQGSAProtocol *owner, NSMutableURLRequest *req, NSHTTPURL
     if (!wire->done || wire->failure || !wire->response) { *error = wire->failure ?: aq_error(15, @"Device provisioning timed out or returned no response."); return nil; }
     *response = wire->response; return wire->body;
 }
-#define AQ_PRIVATE_BACKEND 1
 #include "aquatransport_anisette.inc"
 
 static volatile sig_atomic_t stopping;
