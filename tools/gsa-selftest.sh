@@ -21,6 +21,7 @@ printf 'https://retired-provider.example.invalid/anisette\n' > "$CONF/gsa-aniset
 printf '*\nhttps://gsa.apple.com/\nhttps://example.invalid/\n' > "$CONF/redirects.txt"
 printf '*\nhttps://setup.icloud.com/\nAuthorization: must-not-replace-token\n\n*\nhttps://profile.ess.apple.com/\nAuthorization: must-not-replace-token\n' > "$CONF/headers.txt"
 python tools/gsa-vectors.py > build/gsa-vectors.h
+clang -arch x86_64 -arch i386 -mmacosx-version-min=10.7 tools/anisette-state-test.c -o build/anisette-state-test
 clang -arch x86_64 -arch i386 -mmacosx-version-min=10.7 -Wno-deprecated-declarations \
     -Ibuild -Ibuild/openssl/include tools/gsacrypto.c build/openssl/lib/libcrypto.a -o build/gsacrypto
 clang -arch x86_64 -arch i386 -mmacosx-version-min=10.7 -Wno-deprecated-declarations \
@@ -53,10 +54,11 @@ for mode in success auth missing native-calendar native-contacts; do
 done
 for a in x86_64 i386; do
     arch -"$a" build/gsacrypto
+    arch -"$a" build/anisette-state-test
     AQUATRANSPORT_DIR="$CONF/diagnostic" arch -"$a" build/gsa-diagnose --selftest
     AQUATRANSPORT_DIR="$CONF/diagnostic" arch -"$a" build/anisette-service-test
     AQUATRANSPORT_DIR="$CONF/diagnostic" arch -"$a" build/anisette-ipc-test
-    for mode in success resync resync-header resync-complete resync-routing resync-missing resync-malformed resync-native-failure resync-server-failure resync-invalid-url resync-repeat bad-proof short-proof malformed redirect missing-anisette 2fa 2fa-digits 2fa-long-digits 2fa-numeric 2fa-changed 2fa-changed-nondigit 2fa-wrong-password 2fa-unicode aos aos-basic aos-mixed settings settings-opaque settings-missing settings-redirect aos-settings aos-settings-opaque ids-success ids-gzip ids-2fa ids-2fa-digits ids-2fa-long-digits ids-2fa-numeric ids-2fa-changed ids-2fa-changed-nondigit ids-2fa-wrong-password ids-2fa-unicode ids-rejected ids-bad-gzip ids-gzip-limit ids-gzip-trailing ids-bad-proof ids-missing-anisette ids-redirect ids-bad-delegate ids-missing-token ids-missing-profile ids-bad-status-type; do
+    for mode in success resync resync-header resync-complete resync-routing resync-missing resync-malformed resync-native-failure resync-server-failure resync-invalid-url resync-repeat bad-proof short-proof malformed redirect missing-anisette 2fa 2fa-missing-token 2fa-old-status 2fa-old-status-200 2fa-six-digits 2fa-code-only 2fa-notify-failure 2fa-digits 2fa-long-digits 2fa-numeric 2fa-changed 2fa-changed-nondigit 2fa-unicode aos aos-basic aos-mixed settings settings-opaque settings-missing settings-redirect aos-settings aos-settings-opaque ids-success ids-gzip ids-2fa ids-2fa-missing-token ids-2fa-old-status ids-2fa-six-digits ids-2fa-code-only ids-2fa-notify-failure ids-2fa-digits ids-2fa-long-digits ids-2fa-numeric ids-2fa-changed ids-2fa-changed-nondigit ids-2fa-unicode ids-rejected ids-bad-gzip ids-gzip-limit ids-gzip-trailing ids-bad-proof ids-missing-anisette ids-redirect ids-bad-delegate ids-missing-token ids-missing-profile ids-bad-status-type; do
         AQUATRANSPORT_DIR="$CONF" DYLD_INSERT_LIBRARIES="$LIB" arch -"$a" build/gsaprobe "$mode"
     done
 done
@@ -67,7 +69,7 @@ done
     src/mac/aquatransport_config.c build/openssl/lib/libcrypto.a \
     -framework Foundation -framework IOKit -lz -o build/anisette-ipc-test-gc
 AQUATRANSPORT_DIR="$CONF/diagnostic" build/anisette-ipc-test-gc
-for mode in success resync resync-header resync-complete resync-routing resync-repeat 2fa 2fa-digits 2fa-long-digits 2fa-numeric 2fa-changed 2fa-changed-nondigit 2fa-wrong-password 2fa-unicode aos aos-basic aos-mixed settings settings-opaque aos-settings aos-settings-opaque ids-gzip ids-2fa ids-2fa-digits ids-2fa-long-digits ids-2fa-numeric ids-2fa-changed ids-2fa-changed-nondigit ids-2fa-wrong-password ids-2fa-unicode ids-rejected ids-bad-gzip; do
+for mode in success resync resync-header resync-complete resync-routing resync-repeat 2fa 2fa-missing-token 2fa-old-status 2fa-old-status-200 2fa-six-digits 2fa-code-only 2fa-notify-failure 2fa-digits 2fa-long-digits 2fa-numeric 2fa-changed 2fa-changed-nondigit 2fa-unicode aos aos-basic aos-mixed settings settings-opaque aos-settings aos-settings-opaque ids-gzip ids-2fa ids-2fa-missing-token ids-2fa-old-status ids-2fa-six-digits ids-2fa-code-only ids-2fa-notify-failure ids-2fa-digits ids-2fa-long-digits ids-2fa-numeric ids-2fa-changed ids-2fa-changed-nondigit ids-2fa-unicode ids-rejected ids-bad-gzip; do
     AQUATRANSPORT_DIR="$CONF" DYLD_INSERT_LIBRARIES="$LIB" build/gsaprobe-gc "$mode"
 done
 printf 'disable-icloud-gsa\n' > "$CONF/flags.txt"

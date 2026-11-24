@@ -10,7 +10,7 @@ static NSString *mode;
 static int providerCalls;
 static id localOTP(id self, SEL selector, id owner, NSError **error) {
     providerCalls++;
-    return [mode hasPrefix:@"missing"] ? @{} : @{@"X-Apple-MD": @"fixture-otp", @"X-Apple-MD-M": @"fixture-machine", @"X-Apple-I-MD-RINFO": @"12345"};
+    return [mode hasPrefix:@"missing"] ? @{} : @{@"X-Apple-MD": @"fixture-otp", @"X-Apple-MD-M": @"fixture-machine", @"X-Apple-I-MD-RINFO": @"12345", @"device": AQTestDevice};
 }
 @interface MailMock : NSURLProtocol @end
 @implementation MailMock

@@ -7,6 +7,7 @@
 int main(void) {
     NSAutoreleasePool *pool = [NSAutoreleasePool new];
     testProvisioning();
+    testRoutingRecovery();
     testSynchronization();
     [pool drain]; return 0;
 }

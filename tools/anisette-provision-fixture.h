@@ -2,7 +2,14 @@
  * cryptographic calls and HTTPS responses are replaced; metadata uses scratch
  * files. No Apple framework, account, keychain or real device state is touched. */
 static int adiMode, adiRequests, adiStarts, adiFinishes, adiDestroys, adiOTPs, adiSyncs, adiState;
+static int adiErases, adiEraseFailure;
 static int fakeState(uint64_t dsid) { assert(dsid == UINT64_MAX-1); return adiState; }
+static int fakeErase(uint64_t dsid) {
+    assert(dsid == UINT64_MAX-1 && adiRequests == 2); adiErases++;
+    if (adiEraseFailure == 1) return -1;
+    if (adiEraseFailure != 2) adiState = -45061;
+    return 0;
+}
 static int fakeDispose(void *p) { free(p); return 0; }
 static int fakeStart(uint64_t dsid, const void *p, uint32_t n, void **out, uint32_t *size, uint32_t *session) {
     assert(dsid == UINT64_MAX-1 && n == 4 && !memcmp(p, "spim", 4)); adiStarts++;
@@ -63,26 +70,29 @@ static int fakeSync(uint64_t dsid, const void *server, uint32_t length, void **m
 static void testProvisioning(void) {
     AQADI.state = fakeState; AQADI.otp = fakeOTP; AQADI.start = fakeStart;
     AQADI.finish = fakeFinish; AQADI.destroy = fakeDestroy; AQADI.dispose = fakeDispose;
+    AQADI.erase = fakeErase; adiEraseFailure = 0;
     [NSURLProtocol registerClass:[AQProvisionFixture class]];
     for (adiMode = 0; adiMode <= 9; adiMode++) {
-        adiRequests = adiStarts = adiFinishes = adiDestroys = adiOTPs = 0;
+        adiRequests = adiStarts = adiFinishes = adiDestroys = adiOTPs = adiErases = 0;
         adiState = adiMode == 8 ? -1 : adiMode == 9 ? 0 : -45061;
         char path[] = "/tmp/aquatransport-adi.XXXXXX"; int fd = mkstemp(path); assert(fd >= 0); unlink(path);
         NSError *error = nil;
         NSDictionary *headers = aq_adi_headers(nil, @"fixture-device", fd, &error);
-        if (!adiMode) {
+        if (!adiMode || adiMode == 9) {
             assert(headers && !error && adiRequests == 3 && adiStarts == 1 && adiFinishes == 1 && !adiDestroys && adiOTPs == 1);
             assert([[headers objectForKey:@"X-Apple-I-MD-RINFO"] isEqual:@"12345"]);
+            assert([[headers objectForKey:@"device"] isEqual:@"fixture-device"]);
             assert([[aq_adi_read(fd) objectForKey:@"routing"] isEqual:@"12345"]);
             assert(aq_adi_headers(nil, @"fixture-device", fd, &error) && adiRequests == 3 && adiOTPs == 2);
-            assert(!aq_adi_headers(nil, @"different-device", fd, &error) && [error code] == 18 && adiRequests == 3);
+            assert(adiErases == (adiMode == 9 ? 1 : 0));
+            assert(![aq_adi_read(fd) objectForKey:@"lastAttempt"]);
         } else {
             const int expected[] = {3,1,2,2,3,3,3,1,0,0};
             assert(!headers && error && adiRequests == expected[adiMode] && !adiOTPs);
             assert(adiDestroys == (adiMode >= 4 && adiMode <= 6 ? 1 : 0));
             error = nil;
             assert(!aq_adi_headers(nil, @"fixture-device", fd, &error));
-            assert([error code] == (adiMode == 8 ? 12 : adiMode == 9 ? 18 : 17) && adiRequests == expected[adiMode]);
+            assert([error code] == (adiMode == 8 ? 12 : 17) && adiRequests == expected[adiMode]);
         }
         close(fd);
     }
@@ -95,6 +105,48 @@ static void testProvisioning(void) {
     [NSURLProtocol unregisterClass:[AQProvisionFixture class]];
     memset(&AQADI, 0, sizeof AQADI);
     puts("PASS: native provisioning, 64-bit DSID, routing persistence, failed-session cleanup, cooldown and request bounds (11 cases)");
+}
+
+static void testRoutingRecovery(void) {
+    AQADI.state = fakeState; AQADI.otp = fakeOTP; AQADI.start = fakeStart;
+    AQADI.finish = fakeFinish; AQADI.destroy = fakeDestroy; AQADI.dispose = fakeDispose; AQADI.erase = fakeErase;
+    [NSURLProtocol registerClass:[AQProvisionFixture class]];
+    /* Missing, malformed, foreign-device and invalid routing metadata all use
+     * the same native repair. No user-home record or guessed routing is read. */
+    for (int kind = 0; kind < 4; kind++) {
+        char path[] = "/tmp/aq-routing-recovery.XXXXXX"; int fd = mkstemp(path); assert(fd >= 0); unlink(path);
+        if (kind == 1) assert(write(fd, "broken", 6) == 6);
+        if (kind >= 2) assert(aq_adi_save(fd, @{@"device":kind == 2 ? @"other-device" : @"fixture-device", @"routing":kind == 2 ? @"12345" : @"invalid"}));
+        adiState = 0; adiMode = adiEraseFailure = 0;
+        adiRequests = adiStarts = adiFinishes = adiDestroys = adiOTPs = adiErases = 0;
+        NSError *error = nil;
+        assert(aq_adi_headers(nil, @"fixture-device", fd, &error) && !error);
+        assert(adiErases == 1 && adiRequests == 3 && adiState == 0 && adiOTPs == 1);
+        assert([[aq_adi_read(fd) objectForKey:@"routing"] isEqual:@"12345"]);
+        /* A second user/process sees the same machine file; no second repair. */
+        assert(aq_adi_headers(nil, @"fixture-device", fd, &error) && adiErases == 1 && adiRequests == 3);
+        close(fd);
+    }
+    for (int failure = 1; failure <= 10; failure++) {
+        char path[] = "/tmp/aq-routing-failure.XXXXXX"; int fd = mkstemp(path); assert(fd >= 0); unlink(path);
+        adiState = 0; adiMode = failure <= 7 ? failure : 0;
+        adiEraseFailure = failure == 8 ? 1 : failure == 9 ? 2 : 0;
+        AQADI.erase = failure == 10 ? NULL : fakeErase;
+        adiRequests = adiStarts = adiFinishes = adiDestroys = adiOTPs = adiErases = 0;
+        NSError *error = nil;
+        assert(!aq_adi_headers(nil, @"fixture-device", fd, &error) && error && !adiOTPs);
+        if (failure == 1 || failure == 2 || failure == 7 || failure == 10)
+            assert(!adiErases && adiState == 0); /* Network/URL/ABI failure preserves native state. */
+        int previousRequests = adiRequests, previousErases = adiErases;
+        error = nil;
+        assert(!aq_adi_headers(nil, @"fixture-device", fd, &error));
+        assert([error code] == (failure == 10 ? 18 : 17));
+        assert(adiRequests == previousRequests && adiErases == previousErases);
+        close(fd);
+    }
+    [NSURLProtocol unregisterClass:[AQProvisionFixture class]];
+    memset(&AQADI, 0, sizeof AQADI); adiEraseFailure = 0;
+    puts("PASS: missing/malformed routing repair, selected native record, shared reuse, pre-reset failures and cooldown (14 cases)");
 }
 
 static void testSynchronization(void) {

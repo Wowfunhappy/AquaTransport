@@ -1,11 +1,11 @@
 /* Test-only replacement of the native provider boundary. Production has no provider
  * injection or configuration switch. All OTPs and credentials are synthetic;
- * the adapter reads the real local UUID, which is neither printed nor sent over
- * the network (each probe installs a catch-all URL protocol). */
+ * each probe installs a catch-all URL protocol and supplies a synthetic device ID. */
 #import <objc/runtime.h>
 #include <dlfcn.h>
 #include <assert.h>
 #include <sys/sysctl.h>
+#include <sys/utsname.h>
 
 static NSString *aq_test_client_info(void) {
     char model[256]; size_t length = sizeof model;
@@ -17,6 +17,15 @@ static NSString *aq_test_client_info(void) {
     return [NSString stringWithFormat:@"<%s> <Mac OS X;%@;%@> <com.apple.AuthKit/1 (com.apple.akd/1.0)>", model, version, build];
 }
 #define AQTestClient aq_test_client_info()
+#define AQTestDevice @"00000000-0000-4000-8000-000000000001"
+
+static NSString *aq_test_user_agent(void) {
+    NSBundle *network = [NSBundle bundleWithPath:@"/System/Library/Frameworks/CFNetwork.framework"];
+    NSString *version = [network objectForInfoDictionaryKey:@"CFBundleVersion"];
+    struct utsname system; assert([version length] && !uname(&system));
+    return [NSString stringWithFormat:@"akd/1.0 CFNetwork/%@ Darwin/%s", version, system.release];
+}
+#define AQTestUserAgent aq_test_user_agent()
 
 static IMP aq_test_install_otp(IMP implementation) {
     Class utility = NSClassFromString(@"AQNativeAnisette");

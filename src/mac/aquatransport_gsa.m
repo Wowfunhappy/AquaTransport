@@ -9,8 +9,10 @@
 #include <dlfcn.h>
 #include <syslog.h>
 #include <zlib.h>
+#include <math.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <openssl/rand.h>
 #include <openssl/crypto.h>
 #include "aquatransport_config.h"
 #include "aquatransport_gsa_crypto.h"
@@ -33,6 +35,36 @@ static NSError *aq_error(NSInteger code, NSString *message) {
 static NSDictionary *aq_plist(NSData *d) {
     if (![d length]) return nil;
     return aq_dict([NSPropertyListSerialization propertyListWithData:d options:0 format:NULL error:NULL]);
+}
+static id aq_detached_value(id value) {
+    if ([value isKindOfClass:[NSString class]]) {
+        NSUInteger length = [value length];
+        unichar *characters = malloc(MAX((NSUInteger)1,length)*sizeof(*characters));
+        if (!characters) return nil;
+        if (length) [value getCharacters:characters range:NSMakeRange(0,length)];
+        NSString *result = [[[NSString alloc] initWithCharacters:characters length:length] autorelease];
+        OPENSSL_cleanse(characters,MAX((NSUInteger)1,length)*sizeof(*characters)); free(characters);
+        return result;
+    }
+    if ([value isKindOfClass:[NSData class]])
+        return [NSData dataWithBytes:[value bytes] length:[value length]];
+    if ([value isKindOfClass:[NSArray class]]) {
+        NSMutableArray *result=[NSMutableArray arrayWithCapacity:[value count]];
+        for (id item in value) { id copy=aq_detached_value(item); if (!copy) return nil; [result addObject:copy]; }
+        return [NSArray arrayWithArray:result];
+    }
+    if ([value isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *result=[NSMutableDictionary dictionaryWithCapacity:[value count]];
+        for (id key in value) { id k=aq_detached_value(key),v=aq_detached_value([value objectForKey:key]); if (!k||!v) return nil; [result setObject:v forKey:k]; }
+        return [NSDictionary dictionaryWithDictionary:result];
+    }
+    if ([value isKindOfClass:[NSNumber class]] || [value isKindOfClass:[NSDate class]])
+        return [[value copy] autorelease];
+    return nil;
+}
+static NSDictionary *aq_detached_plist(NSDictionary *value) {
+    id copy=aq_detached_value(value);
+    return [copy isKindOfClass:[NSDictionary class]] ? copy : nil;
 }
 static NSData *aq_encode(id d) {
     return [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];
@@ -75,6 +107,13 @@ static NSData *aq_unbase64(id value) {
     if (p[n-1] == '=') length--;
     if (p[n-2] == '=') length--;
     [out setLength:length]; return length ? out : nil;
+}
+static NSString *aq_request_uuid(void) {
+    CFUUIDRef uuid = CFUUIDCreate(NULL); if (!uuid) return nil;
+    CFStringRef value = CFUUIDCreateString(NULL, uuid); CFRelease(uuid);
+    if (!value) return nil;
+    NSString *result = [NSString stringWithString:[(NSString *)value uppercaseString]];
+    CFRelease(value); return result;
 }
 static NSString *aq_basic(NSString *user, NSString *password) {
     return [@"Basic " stringByAppendingString:aq_base64([[NSString stringWithFormat:@"%@:%@", user, password] dataUsingEncoding:NSUTF8StringEncoding])];
@@ -205,6 +244,7 @@ static NSData *aq_send(AQGSAProtocol *owner, NSMutableURLRequest *req, NSHTTPURL
     return wire->body;
 }
 
+#ifdef AQ_NATIVE_DIAGNOSTIC
 static NSString *aq_device_uuid(void) {
     io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOPlatformExpertDevice"));
     if (!service) return nil;
@@ -214,6 +254,8 @@ static NSString *aq_device_uuid(void) {
     if (value) CFRelease(value);
     return device;
 }
+
+#endif
 
 static NSString *aq_device_field(id value) {
     NSString *s = aq_string(value);
@@ -235,15 +277,21 @@ static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
     if ([owner isStopped]) { *error = aq_error(NSUserCancelledError, @"Sign-in cancelled."); return nil; }
     NSMutableDictionary *headers = [NSMutableDictionary dictionary];
     @synchronized([AQGSAProtocol class]) {
-        NSString *device = aq_device_field(aq_device_uuid());
-        if (!device) { *error = aq_error(13, @"Local Anisette is unavailable: this Mac has no hardware UUID."); return nil; }
+        NSString *device = nil;
         @try {
             NSDictionary *d = aq_dict([AQNativeAnisette headersForOwner:owner error:error]);
+            /* The helper owns both provisioning and identity. Require them
+             * together instead of guessing the identity of an older helper. */
+            device = aq_device_field([d objectForKey:@"device"]);
             NSString *machine = aq_device_field([d objectForKey:@"X-Apple-MD-M"]);
             NSString *oneTime = aq_device_field([d objectForKey:@"X-Apple-MD"]);
             NSString *routing = aq_adi_routing([d objectForKey:@"X-Apple-I-MD-RINFO"]);
             if (!machine || !oneTime || !routing) {
                 if (!*error) *error = aq_error(12, @"Local Anisette returned no usable device authentication data."); return nil;
+            }
+            if (!device) {
+                if (!*error) *error = aq_error(13, @"Local device authentication returned no usable device identity. Update the helper and restart.");
+                return nil;
             }
             [headers setObject:machine forKey:@"X-Apple-I-MD-M"];
             [headers setObject:oneTime forKey:@"X-Apple-I-MD"];
@@ -255,7 +303,7 @@ static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
         [headers setObject:aq_base64([device dataUsingEncoding:NSUTF8StringEncoding]) forKey:@"X-Apple-I-MD-LU"];
     }
     NSString *clientInfo = aq_client_info();
-    if (!clientInfo) { *error = aq_error(13, @"Local Anisette is unavailable: this Mac has no usable model or system version."); return nil; }
+    if (!clientInfo || !aq_akd_user_agent()) { *error = aq_error(13, @"Local Anisette is unavailable: this Mac has no usable model or system version."); return nil; }
     [headers setObject:clientInfo forKey:@"X-MMe-Client-Info"];
     NSDateFormatter *date = [[[NSDateFormatter alloc] init] autorelease];
     [date setLocale:[[[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"] autorelease]];
@@ -271,7 +319,7 @@ static NSMutableURLRequest *aq_apple_request(NSString *url, NSDictionary *header
     NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
     [r setValue:@"text/x-xml-plist" forHTTPHeaderField:@"Content-Type"];
     [r setValue:@"text/x-xml-plist" forHTTPHeaderField:@"Accept"];
-    [r setValue:@"akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0" forHTTPHeaderField:@"User-Agent"];
+    [r setValue:aq_akd_user_agent() forHTTPHeaderField:@"User-Agent"];
     [r setValue:aq_client_info() forHTTPHeaderField:@"X-Mme-Client-Info"];
     for (NSString *k in headers) [r setValue:[headers objectForKey:k] forHTTPHeaderField:k];
     return r;
@@ -342,6 +390,51 @@ static BOOL aq_resynchronize(AQGSAProtocol *owner, NSDictionary *status, NSHTTPU
     syslog(LOG_NOTICE, "AquaTransport GrandSlam device resynchronization succeeded (adapter 12)");
     return YES;
 }
+static NSTimeInterval aq_otp_boundary_delay(NSTimeInterval now) {
+    double position = fmod(now, 30.0);
+    if (position < 0) position += 30.0;
+    return 30.5 - position;
+}
+static NSDictionary *aq_anisette_after_sync(AQGSAProtocol *owner, NSDictionary *previous, NSError **error) {
+    NSDictionary *fresh = aq_anisette(owner, error);
+    if (!fresh) return nil;
+    if (![[fresh objectForKey:@"X-Mme-Device-Id"] isEqual:[previous objectForKey:@"X-Mme-Device-Id"]]) {
+        *error = aq_error(49, @"Device identity changed during synchronization. Restart sign-in."); return nil;
+    }
+    NSString *oldOTP = aq_device_field([previous objectForKey:@"X-Apple-I-MD"]);
+    NSString *newOTP = aq_device_field([fresh objectForKey:@"X-Apple-I-MD"]);
+    if (!oldOTP || !newOTP) { *error = aq_error(29, @"Device resynchronization returned no usable one-time code."); return nil; }
+    if (![oldOTP isEqual:newOTP]) {
+        NSMutableDictionary *result = [[fresh mutableCopy] autorelease];
+        NSString *requestUUID = aq_device_field([previous objectForKey:@"X-Apple-I-Request-UUID"]);
+        if (requestUUID) [result setObject:requestUUID forKey:@"X-Apple-I-Request-UUID"];
+        syslog(LOG_NOTICE, "AquaTransport GrandSlam device OTP advanced immediately after resynchronization (adapter 12)");
+        return result;
+    }
+    /* Mavericks CoreADI returns the same OTP throughout a 30-second window.
+     * Reusing the OTP which caused a 434 makes Apple issue another 434 even
+     * after midSyncMachine accepted the repair. Wait only to the next window. */
+    NSTimeInterval delay = aq_otp_boundary_delay([[NSDate date] timeIntervalSince1970]);
+    syslog(LOG_NOTICE, "AquaTransport GrandSlam resynchronization waiting %.1f seconds for a new device OTP (adapter 12)", delay);
+    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:delay];
+    while (![owner isStopped] && [until timeIntervalSinceNow] > 0)
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:
+            [NSDate dateWithTimeIntervalSinceNow:MIN(0.05, [until timeIntervalSinceNow])]];
+    if ([owner isStopped]) { *error = aq_error(NSUserCancelledError, @"Sign-in cancelled."); return nil; }
+    fresh = aq_anisette(owner, error); if (!fresh) return nil;
+    if (![[fresh objectForKey:@"X-Mme-Device-Id"] isEqual:[previous objectForKey:@"X-Mme-Device-Id"]]) {
+        *error = aq_error(49, @"Device identity changed during synchronization. Restart sign-in."); return nil;
+    }
+    newOTP = aq_device_field([fresh objectForKey:@"X-Apple-I-MD"]);
+    if (!newOTP || [oldOTP isEqual:newOTP]) {
+        *error = aq_error(29, @"Device one-time code did not advance after resynchronization."); return nil;
+    }
+    NSMutableDictionary *result = [[fresh mutableCopy] autorelease];
+    NSString *requestUUID = aq_device_field([previous objectForKey:@"X-Apple-I-Request-UUID"]);
+    if (requestUUID) [result setObject:requestUUID forKey:@"X-Apple-I-Request-UUID"];
+    syslog(LOG_NOTICE, "AquaTransport GrandSlam device OTP advanced after resynchronization wait (adapter 12)");
+    return result;
+}
 static NSDictionary *aq_exchange(AQGSAProtocol *owner, NSMutableDictionary *payload, NSDictionary **headers, NSError **error) {
     for (int attempt = 0; attempt < 2; attempt++) {
         NSDictionary *active = *headers;
@@ -350,17 +443,14 @@ static NSDictionary *aq_exchange(AQGSAProtocol *owner, NSMutableDictionary *payl
         [cpd setObject:[NSNumber numberWithBool:YES] forKey:@"icscrec"];
         [cpd setObject:[NSNumber numberWithBool:NO] forKey:@"pbe"];
         [cpd setObject:[NSNumber numberWithBool:YES] forKey:@"prkgen"];
-        /* svct is the service category; com.apple.gs.xcode.auth belongs to
-         * X-Apple-App-Info during verification, not this field. */
         [cpd setObject:@"iCloud" forKey:@"svct"];
         [cpd setObject:@"en_US" forKey:@"loc"];
         [payload setObject:cpd forKey:@"cpd"];
         NSDictionary *outer = [NSDictionary dictionaryWithObjectsAndKeys:
             [NSDictionary dictionaryWithObject:@"1.0.1" forKey:@"Version"], @"Header", payload, @"Request", nil];
-        /* GSAPort sends the OTP inside cpd. Its HTTP headers carry only the
-         * machine/device identity; don't submit the OTP a second time as a header. */
+        /* One request profile: OTP in cpd, machine identity in the envelope. */
         NSMutableDictionary *httpHeaders = [NSMutableDictionary dictionary];
-        for (NSString *k in [NSArray arrayWithObjects:@"X-Apple-I-MD-M", @"X-Mme-Device-Id", @"X-MMe-Client-Info", nil])
+        for (NSString *k in @[@"X-Apple-I-MD-M", @"X-Mme-Device-Id", @"X-MMe-Client-Info"])
             if ([active objectForKey:k]) [httpHeaders setObject:[active objectForKey:k] forKey:k];
         NSMutableURLRequest *req = aq_apple_request(@"https://gsa.apple.com/grandslam/GsService2", httpHeaders);
         [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
@@ -375,7 +465,7 @@ static NSDictionary *aq_exchange(AQGSAProtocol *owner, NSMutableDictionary *payl
             [hsc isKindOfClass:[NSNumber class]] && [hsc integerValue] == 434) {
             syslog(LOG_NOTICE, "AquaTransport GrandSlam requested device resynchronization (adapter 12)");
             if (!aq_resynchronize(owner, replyStatus, r, active, error)) return nil;
-            NSDictionary *fresh = aq_anisette(owner, error); if (!fresh) return nil;
+            NSDictionary *fresh = aq_anisette_after_sync(owner, active, error); if (!fresh) return nil;
             *headers = fresh; continue;
         }
         syslog(LOG_NOTICE, "AquaTransport GrandSlam %s failed (HTTP %ld, hsc %ld, ec %ld)",
@@ -406,33 +496,79 @@ static NSDictionary *aq_decrypt(NSData *encrypted, unsigned char key[32]) {
         if (!result) {
             NSMutableData *wrapped = [NSMutableData dataWithData:[@"<plist version=\"1.0\">" dataUsingEncoding:NSUTF8StringEncoding]];
             [wrapped appendData:plain]; [wrapped appendData:[@"</plist>" dataUsingEncoding:NSUTF8StringEncoding]];
-            result = aq_plist(wrapped);
+            result = aq_detached_plist(aq_plist(wrapped));
             OPENSSL_cleanse([wrapped mutableBytes], [wrapped length]);
         }
+        result = aq_detached_plist(result);
     }
     OPENSSL_cleanse([plain mutableBytes], [plain length]);
     return result;
 }
 
-static BOOL aq_second_factor(AQGSAProtocol *owner, NSString *identity, NSString *code, NSError **error) {
+static NSString *aq_verification_client_info(void) {
+    NSString *client = aq_client_info();
+    if (!client) return nil;
+    NSRange application = [client rangeOfString:@" <" options:NSBackwardsSearch];
+    if (application.location == NSNotFound) return nil;
+    return [[client substringToIndex:application.location] stringByAppendingString:
+        @" <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>"];
+}
+
+static NSString *aq_pet_from_header(id value) {
+    NSString *encoded = aq_device_field(value);
+    if (!encoded) return nil;
+    NSData *decoded = aq_unbase64(encoded);
+    /* Reject malformed/noncanonical base64 and credentials for another service. */
+    if (!decoded || ![aq_base64(decoded) isEqual:encoded]) return nil;
+    NSString *envelope = [[[NSString alloc] initWithData:decoded encoding:NSUTF8StringEncoding] autorelease];
+    NSString *prefix = @"com.apple.gs.idms.pet:";
+    if (![envelope hasPrefix:prefix]) return nil;
+    return aq_device_field([envelope substringFromIndex:[prefix length]]);
+}
+
+static BOOL aq_second_factor(AQGSAProtocol *owner, NSString *identity, NSString *device, NSString *code, NSString **pet, NSError **error) {
+    if (pet) *pet = nil;
     NSDictionary *headers = aq_anisette(owner, error);
     if (!headers) return NO;
+    if (!device || ![[headers objectForKey:@"X-Mme-Device-Id"] isEqual:device]) {
+        *error = aq_error(49, @"Device identity changed during verification. Restart sign-in."); return NO;
+    }
     NSMutableURLRequest *req = aq_apple_request(code ? @"https://gsa.apple.com/grandslam/GsService2/validate" :
                                                         @"https://gsa.apple.com/auth/verify/trusteddevice", headers);
     [req setValue:identity forHTTPHeaderField:@"X-Apple-Identity-Token"];
     [req setValue:@"com.apple.gs.xcode.auth" forHTTPHeaderField:@"X-Apple-App-Info"];
     [req setValue:@"11.2 (11B41)" forHTTPHeaderField:@"X-Xcode-Version"];
+    NSString *clientInfo = aq_verification_client_info();
+    if (!clientInfo) { *error = aq_error(13, @"Could not construct the verification client identity."); return NO; }
+    [req setValue:clientInfo forHTTPHeaderField:@"X-MMe-Client-Info"];
     if (code) [req setValue:code forHTTPHeaderField:@"security-code"];
     NSHTTPURLResponse *r = nil;
     NSData *d = aq_send(owner, req, &r, error);
     if (!d) return NO;
-    NSDictionary *status = aq_dict([aq_plist(d) objectForKey:@"Status"]);
+    NSDictionary *body = aq_plist(d);
+    /* /validate uses a top-level ec, unlike the SRP Response.Status envelope. */
+    NSDictionary *status = [body objectForKey:@"ec"] ? body : aq_dict([body objectForKey:@"Status"]);
     id ec = [status objectForKey:@"ec"];
-    if ([r statusCode] != 200 || (ec && (![ec respondsToSelector:@selector(integerValue)] || [ec integerValue] != 0))) {
+    BOOL numeric = [ec isKindOfClass:[NSNumber class]];
+    syslog(LOG_NOTICE, "AquaTransport verification %s response (HTTP %ld, ec %ld, recognized=%d)",
+        code ? "validation" : "notification", (long)[r statusCode], numeric ? (long)[ec integerValue] : LONG_MIN, numeric);
+    if ([r statusCode] != 200 || (code && !numeric) || (ec && (!numeric || ![ec isEqualToNumber:@0]))) {
         *error = aq_error(21, @"Apple rejected the verification request."); return NO;
+    }
+    if (code) {
+        id envelope = aq_response_header(r, @"X-Apple-PE-Token");
+        NSString *token = aq_pet_from_header(envelope);
+        syslog(LOG_NOTICE, "AquaTransport verification token (present=%d, valid=%d, adapter 18)", envelope != nil, token != nil);
+        if (!token) {
+            *error = aq_error(47, envelope ? @"Apple returned a malformed iCloud password-equivalent token." :
+                @"Apple accepted verification without returning an iCloud password-equivalent token.");
+            return NO;
+        }
+        if (pet) *pet = token;
     }
     return YES;
 }
+
 
 static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *password, NSError **error) {
     /* Runs on the serial worker queue. No passwords are retained between attempts. */
@@ -444,21 +580,29 @@ static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *pa
     if (pending) {
         NSUInteger length = [password length];
         NSNumber *originalLength = [pending objectForKey:@"passwordLength"];
-        /* Retrying the original password must never consume its numeric suffix
-         * as a code. Length is a format hint; SRP still checks the password.
-         * NSString length and slicing both use UTF-16 code units. */
-        NSString *code = originalLength && length > 6 && length-6 == [originalLength unsignedIntegerValue] ?
-            [password substringFromIndex:length-6] : nil;
+        /* A six-digit password must remain a password on a retry. */
+        BOOL appended = originalLength && length > 6 && length-6 == [originalLength unsignedIntegerValue];
+        BOOL codeOnly = length == 6 && [originalLength unsignedIntegerValue] != 6;
+        NSString *code = appended ? [password substringFromIndex:length-6] : codeOnly ? password : nil;
         if (code && [code rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet]].location == NSNotFound) {
-            if (!aq_second_factor(owner, [pending objectForKey:@"identity"], code, error)) return nil;
-            password = [password substringToIndex:length-6];
+            NSString *pet = nil;
+            if (!aq_second_factor(owner, [pending objectForKey:@"identity"], [pending objectForKey:@"device"], code, &pet, error)) return nil;
+            NSMutableDictionary *session = [[aq_dict([pending objectForKey:@"session"]) mutableCopy] autorelease];
+            if (!session) { *error = aq_error(26, @"Missing verification session."); return nil; }
+            [session setObject:@{@"com.apple.gs.idms.pet":@{@"token":pet}} forKey:@"t"];
+            [AQPending removeObjectForKey:account];
+            return session;
         }
-        /* Otherwise this is a fresh password attempt, including a retry of a
-         * password ending in digits. Authenticate it intact to request a new code. */
+        /* The original password or changed input starts a fresh exchange. */
         [AQPending removeObjectForKey:account];
     }
     NSDictionary *headers = aq_anisette(owner, error);
     if (!headers) return nil;
+    NSString *requestUUID = aq_request_uuid();
+    if (!requestUUID) { *error = aq_error(22, @"Could not create a GrandSlam request identifier."); return nil; }
+    NSMutableDictionary *attemptHeaders = [[headers mutableCopy] autorelease];
+    [attemptHeaders setObject:requestUUID forKey:@"X-Apple-I-Request-UUID"];
+    headers = attemptHeaders;
     unsigned char A[256], M[32], key[32] = {0};
     aq_srp *srp = aq_srp_new(A);
     if (!srp) { *error = aq_error(22, @"Could not initialize SRP."); return nil; }
@@ -490,19 +634,35 @@ static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *pa
         spd = aq_decrypt(aq_data([reply objectForKey:@"spd"]), key);
         if (!spd) { *error = aq_error(25, @"Invalid encrypted GrandSlam session data."); return nil; }
         NSDictionary *status = aq_dict([reply objectForKey:@"Status"]);
-        NSString *secondary = aq_string([status objectForKey:@"au"]);
-        if ([secondary isEqual:@"trustedDeviceSecondaryAuth"]) {
+        /* Normalize the verification hint from either response location. */
+        NSString *secondary = aq_string([spd objectForKey:@"au"]);
+        if (!secondary) secondary = aq_string([status objectForKey:@"au"]);
+        NSInteger hsc = [[status objectForKey:@"hsc"] integerValue];
+        /* hsc 409 is itself the authenticated indication that verification is
+         * required. Apple's current response can omit au or use a new method
+         * name, so do not discard a valid session based on that hint alone. */
+        if (hsc == 409 || [secondary isEqual:@"trustedDeviceSecondaryAuth"]) {
+            const char *method = !secondary ? "absent" :
+                [secondary isEqual:@"trustedDeviceSecondaryAuth"] ? "trusted-device" : "other";
+            syslog(LOG_NOTICE, "AquaTransport GrandSlam verification required (method=%s, hsc=%ld, hint=%s, adapter 18)", method, (long)hsc,
+                aq_string([spd objectForKey:@"au"]) ? "session" : secondary ? "status" : "absent");
             NSString *dsid = aq_string([spd objectForKey:@"adsid"]), *token = aq_string([spd objectForKey:@"GsIdmsToken"]);
             if (!dsid || !token) { *error = aq_error(26, @"Missing verification session."); return nil; }
             NSString *identity = aq_base64([[NSString stringWithFormat:@"%@:%@", dsid, token] dataUsingEncoding:NSUTF8StringEncoding]);
-            if (!aq_second_factor(owner, identity, nil, error)) return nil;
+            /* Request the normal approval prompt for every authenticated 409.
+             * au is only a server hint and must not suppress notification. */
+            NSError *notificationError = nil;
+            if (!aq_second_factor(owner, identity, [headers objectForKey:@"X-Mme-Device-Id"], nil, NULL, &notificationError))
+                syslog(LOG_NOTICE, "AquaTransport could not request an automatic trusted-device prompt; manual verification code remains available (adapter 14)");
+            if ([owner isStopped]) { *error = aq_error(NSUserCancelledError, @"Sign-in cancelled."); return nil; }
             if ([AQPending count] >= 32) [AQPending removeAllObjects];
             [AQPending setObject:[NSDictionary dictionaryWithObjectsAndKeys:identity, @"identity",
+                spd, @"session", [headers objectForKey:@"X-Mme-Device-Id"], @"device",
                 [NSNumber numberWithUnsignedInteger:[password length]], @"passwordLength",
                 [NSDate dateWithTimeIntervalSinceNow:300], @"expires", nil] forKey:account];
-            *error = aq_error(401, @"Approve sign-in on your trusted device, then enter your password followed by the six-digit code."); return nil;
+            *error = aq_error(401, @"Enter the six-digit verification code, either by itself or immediately after your password."); return nil;
         }
-        if (secondary || [[status objectForKey:@"hsc"] integerValue] != 200) {
+        if (secondary || hsc != 200) {
             *error = aq_error(27, @"This account requires an unsupported verification method (such as SMS)."); return nil;
         }
     } @finally { aq_srp_free(srp); OPENSSL_cleanse(key, sizeof key); OPENSSL_cleanse(M, sizeof M); }
@@ -512,6 +672,50 @@ static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *pa
 static NSDictionary *aq_result(NSHTTPURLResponse *response, NSData *data) {
     return [NSDictionary dictionaryWithObjectsAndKeys:response, @"response", data, @"data", nil];
 }
+
+/* Serial authentication queue only. Preserve one successful IDS reply briefly
+ * for an identical retry after the one-time verification input was consumed.
+ * A random per-record HMAC key avoids retaining the request/password itself. */
+static NSDictionary *AQIDSRetryResult;
+static unsigned char AQIDSRetryKey[32], AQIDSRetryTag[32];
+static NSTimeInterval AQIDSRetryDeadline;
+
+static void aq_ids_retry_clear(void) {
+    [AQIDSRetryResult release]; AQIDSRetryResult = nil;
+    AQIDSRetryDeadline = 0;
+    OPENSSL_cleanse(AQIDSRetryKey, sizeof AQIDSRetryKey);
+    OPENSSL_cleanse(AQIDSRetryTag, sizeof AQIDSRetryTag);
+}
+
+static BOOL aq_ids_retry_tag(NSURLRequest *request, NSDictionary *body, unsigned char tag[32]) {
+    if (!body || !aq_ids_url([request URL])) return NO;
+    NSData *encoded = aq_encode(@[body, [[request URL] absoluteString],
+        [request valueForHTTPHeaderField:@"x-ds-client-id"] ?: @"",
+        [request valueForHTTPHeaderField:@"x-protocol-version"] ?: @""]);
+    unsigned int length = 0;
+    return [encoded length] && HMAC(EVP_sha256(), AQIDSRetryKey, sizeof AQIDSRetryKey,
+        [encoded bytes], [encoded length], tag, &length) && length == 32;
+}
+
+static NSDictionary *aq_ids_retry_lookup(NSURLRequest *request, NSDictionary *body, NSTimeInterval now) {
+    if (!AQIDSRetryResult) return nil;
+    if (now >= AQIDSRetryDeadline) { aq_ids_retry_clear(); return nil; }
+    unsigned char tag[32];
+    BOOL match = aq_ids_retry_tag(request, body, tag) && !CRYPTO_memcmp(tag, AQIDSRetryTag, sizeof tag);
+    OPENSSL_cleanse(tag, sizeof tag);
+    if (!match) { aq_ids_retry_clear(); return nil; }
+    return [[AQIDSRetryResult retain] autorelease];
+}
+
+static void aq_ids_retry_remember(NSURLRequest *request, NSDictionary *body, NSDictionary *result, NSTimeInterval now) {
+    aq_ids_retry_clear();
+    if (RAND_bytes(AQIDSRetryKey, sizeof AQIDSRetryKey) != 1 || !aq_ids_retry_tag(request, body, AQIDSRetryTag)) {
+        aq_ids_retry_clear(); return;
+    }
+    AQIDSRetryResult = [result retain];
+    AQIDSRetryDeadline = now + 60;
+}
+
 static NSDictionary *aq_bridge(AQGSAProtocol *owner, NSURLRequest *original, NSError **error) {
     NSDictionary *idsBody = aq_ids_url([original URL]) ? aq_request_plist(original) : nil;
     NSString *idsUser = aq_string([idsBody objectForKey:@"username"]);
@@ -519,6 +723,13 @@ static NSDictionary *aq_bridge(AQGSAProtocol *owner, NSURLRequest *original, NSE
     NSArray *credentials = aq_ids_url([original URL]) ?
         (idsUser && idsPassword ? [NSArray arrayWithObjects:idsUser, idsPassword, nil] : nil) : aq_credentials(original);
     if (!credentials) { *error = aq_error(30, @"Unsupported iCloud credential format."); return nil; }
+    if (idsBody) {
+        NSDictionary *repeated = aq_ids_retry_lookup(original, idsBody, [[NSProcessInfo processInfo] systemUptime]);
+        if (repeated) {
+            syslog(LOG_NOTICE, "AquaTransport iMessage repeated authentication reused its completed delegate response (adapter 15)");
+            return repeated;
+        }
+    }
     if (aq_settings_request(original, credentials)) {
         NSDictionary *headers = aq_anisette(owner, error);
         if (!headers) return nil;
@@ -534,7 +745,7 @@ static NSDictionary *aq_bridge(AQGSAProtocol *owner, NSURLRequest *original, NSE
      * The password remains byte-for-byte as submitted. */
     NSString *submittedUser = [credentials objectAtIndex:0];
     NSString *user = [submittedUser lowercaseString];
-    syslog(LOG_NOTICE, "AquaTransport iCloud credentials decoded (source %s, account case normalized %s)",
+    syslog(LOG_NOTICE, "AquaTransport iCloud credentials decoded (adapter 18, source %s, account case normalized %s)",
         [[[original valueForHTTPHeaderField:@"Authorization"] lowercaseString] hasPrefix:@"basic "] ? "Basic" : "plist",
         [submittedUser isEqual:user] ? "no" : "yes");
     NSDictionary *session = aq_login(owner, user, [credentials objectAtIndex:1], error);
@@ -573,7 +784,9 @@ static NSDictionary *aq_bridge(AQGSAProtocol *owner, NSURLRequest *original, NSE
         }
         NSDictionary *result = [NSDictionary dictionaryWithObjectsAndKeys:[NSNumber numberWithInt:0], @"status",
             profile, @"profile-id", token, @"auth-token", nil];
-        return aq_result(response, aq_encode(result));
+        NSDictionary *completed = aq_result(response, aq_encode(result));
+        aq_ids_retry_remember(original, idsBody, completed, [[NSProcessInfo processInfo] systemUptime]);
+        return completed;
     }
     if ([[[original URL] path] isEqual:@"/setup/iosbuddy/loginDelegates"]) {
         NSMutableDictionary *body = [[aq_plist([original HTTPBody]) mutableCopy] autorelease];

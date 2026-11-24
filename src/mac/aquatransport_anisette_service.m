@@ -1,7 +1,7 @@
 /* Socket-activated native Anisette generator. Clients can generate device headers,
  * transform Apple's resynchronization challenge, or persist returned routing.
  * Account identities/passwords/tokens never cross IPC. Apple's provisioning HTTPS
- * exchange runs only for missing native state. */
+ * exchange runs for missing native state or bounded missing-routing recovery. */
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
 #include <openssl/evp.h>
@@ -16,6 +16,7 @@
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <mach/mach_time.h>
+#include <syslog.h>
 #include "aquatransport_anisette_service.h"
 #include "aquatransport_client_info.inc"
 
@@ -58,7 +59,7 @@ static NSString *aq_device_field(id value) {
 static NSMutableURLRequest *aq_apple_request(NSString *url, NSDictionary *headers) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
     [req setValue:@"text/x-xml-plist" forHTTPHeaderField:@"Accept"];
-    [req setValue:@"akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0" forHTTPHeaderField:@"User-Agent"];
+    [req setValue:aq_akd_user_agent() forHTTPHeaderField:@"User-Agent"];
     [req setValue:aq_client_info() forHTTPHeaderField:@"X-Mme-Client-Info"];
     for (NSString *key in headers) [req setValue:[headers objectForKey:key] forHTTPHeaderField:key];
     return req;
@@ -109,6 +110,7 @@ static NSData *aq_send(AQGSAProtocol *owner, NSMutableURLRequest *req, NSHTTPURL
     if (!wire->done || wire->failure || !wire->response) { *error = wire->failure ?: aq_error(15, @"Device provisioning timed out or returned no response."); return nil; }
     *response = wire->response; return wire->body;
 }
+#define AQ_ANISETTE_WORKER 1
 #include "aquatransport_anisette.inc"
 
 static volatile sig_atomic_t stopping;
@@ -195,15 +197,16 @@ static pid_t startWorker(int client, int listener) {
     char *arguments[] = {AQ_ANISETTE_EXECUTABLE, "--worker", NULL};
     char *environment[] = {"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C", home, name, login, NULL};
     gid_t primary = user->pw_gid;
+    int stateFD = aq_adi_open_state(AQ_ANISETTE_STATE_DIRECTORY, 0);
+    if (stateFD < 0) return -1;
     pid_t child = fork();
     if (!child) {
-        close(listener);
         if (setgroups(count, supplementary) || setgid(primary) || setuid(uid) ||
-            getuid() != uid || geteuid() != uid || chdir("/") || dup2(client, STDIN_FILENO) < 0) _exit(126);
-        if (client != STDIN_FILENO) close(client);
+            getuid() != uid || geteuid() != uid || chdir("/") || aq_adi_worker_fds(client, listener, stateFD)) _exit(126);
         execve(AQ_ANISETTE_EXECUTABLE, arguments, environment);
         _exit(127);
     }
+    close(stateFD);
     return child;
 }
 static void finishWorker(pid_t child) {

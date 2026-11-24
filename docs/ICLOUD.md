@@ -5,6 +5,55 @@ into GrandSlam authentication on **OS X 10.7–10.9**. AquaTransport's TLS engin
 still supports 10.6; this module does not add iCloud to Snow Leopard.
 The authentication adapter is enabled by default.
 
+**Current candidate (2026.11.24.3, adapter 18):** Device authentication uses
+only the Mac's native AOSKit backend and hardware identity. There is one minimal
+GrandSlam request profile, with a User-Agent built from the installed CFNetwork
+and Darwin versions. The private CoreADI backend, alternate profile flag and
+speculative second SRP exchange after verification have been removed.
+
+After successful code validation, the adapter requires a valid password-equivalent
+token in `X-Apple-PE-Token`. Missing or malformed tokens stop the attempt with a
+specific diagnostic; the adapter does not try a second authentication strategy.
+The initial password exchange, optional verification and token exchange form one
+state machine. Verification hints in either `Status.au` or the encrypted session
+are normalized before entering that same verification state. These supported
+field locations do not establish that Apple requires separate client profiles.
+
+The helper returns its device identity with every proof; clients no longer infer
+an identity when an older helper omits it. Installation must update both the
+client and helper, followed by a reboot. The identity is checked again during
+verification and resynchronization. Logs record fixed stage labels, numeric
+statuses, verification-hint location and token presence/validity, never token values.
+Live acceptance by Apple remains to be tested on affected accounts.
+
+**Missing-metadata recovery (2026.11.24.3):** AquaTransport uses one machine-wide
+`/usr/share/aquatransport/state/anisette.plist`. The root broker opens and locks it
+before handing an already-open descriptor to the worker running as the requesting
+user. The directory is root-owned mode 0700 and the file is mode 0600. No metadata
+is created in a user's Library, and no old routing record needs to be migrated.
+
+If native state is provisioned but the routing record is absent, malformed, or
+belongs to a different hardware UUID, the helper records a bounded repair attempt.
+It first obtains a valid provisioning challenge from Apple, then invokes AOSKit's
+native RP/reset operation for the production `-2` record only and runs the normal
+provisioning exchange. It does not delete the ADI directory or other native records.
+A failed attempt imposes a machine-wide 24-hour cooldown. Unknown native errors,
+missing reset support and failures before a valid start challenge do not reset
+native state. Successful provisioning clears the attempt marker. Ordinary account
+or password failures do not trigger this repair.
+
+The Mavericks routing-query probe returned error -45019, so this implementation
+does not depend on recovering a routing value directly from CoreADI or guessing
+one. Recovery is tested with synthetic native routines and mocked Apple responses;
+no live reprovisioning of the user's working Mac was performed for this change.
+
+Validation for 2026.11.24.3: the offline GSA suite passed 220 reported checks,
+including missing/corrupt/mismatched metadata, recovery cooldown, failures before
+native reset, reset errors, shared-record reuse, secure file opening and descriptor
+inheritance on both Intel architectures. All four Find My checks passed. The native
+RP/reset wrapper is present in both installed Mavericks AOSKit slices; its calling
+convention was checked against Apple's own provisioning-action handler.
+
 **Local-only change (2026-09-28):** Device authentication now uses only the Mac's
 AOSKit/CoreADI. Both the public provider and configurable HTTP providers have been
 removed. Native Apple provisioning succeeded on this Mavericks machine, and the
@@ -93,8 +142,7 @@ outstanding.
 
 ## Local Anisette generation
 
-GrandSlam needs fresh device authentication data as well as SRP. The only generator
-is Apple's installed AOSKit/CoreADI, called by the bundled
+GrandSlam needs fresh device authentication data as well as SRP. The generator uses Apple's installed AOSKit/CoreADI, called by the bundled
 `aquatransport-anisette` helper. Its job plist lives at
 `/usr/share/aquatransport/org.aquatransport.anisette.plist`. The existing
 `aquatransport-bootstrap` registers it on Lion and later, unless iCloud support
@@ -105,12 +153,14 @@ All clients use `/var/run/org.aquatransport.anisette.sock`. Clients verify the
 server's root identity. The broker obtains each client's user ID from the kernel
 and starts a fresh worker with that user's groups, UID and home directory;
 only the worker calls Apple's native generator. Workers verify the peer again.
+The broker supplies the locked machine-state file as descriptor 3; the worker
+validates its ownership and permissions and never opens a user-selected path.
 The socket accepts requests to generate device headers, transform an Apple-issued
 resynchronization message with CoreADI, and persist routing returned by that same
 exchange. Account names, passwords, verification codes and service tokens never
 pass through it. Resynchronization input and output are bounded. There is
 no TCP listener, remote provider, provider URL setting, downloaded runtime, or
-alternate generation path. Failure stops authentication.
+remote generation path. Failure stops authentication.
 
 The separate process is necessary on Mavericks: the running Mail, Calendar and
 CalendarAgent sandboxes deny access to Apple's `/Users/Shared/adi` state and to
@@ -135,10 +185,11 @@ On first use, if the native state check specifically returns `-45061` (not
 provisioned), the helper performs a single lookup/start/finish exchange directly
 with `gsa.apple.com`: at most three HTTPS requests, no redirects or automatic
 retries, 30 seconds per request. Apple's native routines create and finish the
-cryptographic challenge and retain the resulting ADI state. Each user's metadata
+cryptographic challenge and retain the resulting ADI state. The machine-wide metadata
 file is locked across processes, and a failed attempt imposes a 24-hour cooldown.
-Unknown native errors do not trigger provisioning. Existing native state is never
-reset or copied from another device.
+Unknown native errors do not trigger provisioning. Native state is reset only for
+the explicit missing-routing repair described above; it is never copied from
+another device.
 
 The obsolete `/usr/share/aquatransport/config/gsa-anisette-url.txt` file is no longer
 read. A file left by an older installation has no effect and can be removed. The
@@ -163,6 +214,20 @@ The adapter adds current time, timezone and locale and forwards no other native
 dictionary fields. Once provisioned, header generation and the native half of
 resynchronization make no HTTP requests. Account proofs, verification codes,
 service tokens and generated device headers go directly to Apple.
+
+### Device identity
+
+There is one native AOSKit backend, using Apple's `/Users/Shared/adi` and the
+matching machine-wide AquaTransport routing record under the installation folder.
+Both proofs and outgoing identity headers use the helper's hardware UUID. A helper
+that omits that identity is rejected explicitly.
+
+Previous per-user `Library/Application Support/AquaTransport` metadata and private
+state are not read by this build. They can be removed after updating; their values
+are not needed for recovery. Missing current metadata is repaired on demand. No
+installation-time reset or account sign-out is performed. Existing account tokens
+are not cleared by native device reprovisioning; live service acceptance after a
+repair still requires testing.
 
 ### V3 and native generation
 
@@ -192,18 +257,11 @@ started a new broker and successfully generated native headers. The rebuilt
 installer contains the feature plist under `/usr/share/aquatransport` and no
 Anisette LaunchAgent.
 
-`~/Library/Application Support/AquaTransport/anisette.plist` contains the hardware
+`/usr/share/aquatransport/state/anisette.plist` contains the hardware
 UUID, routing value and last attempt time, with directory mode 0700 and file mode
 0600. Routing is saved before committing newly provisioned native state. The
-Apple ADI blobs are not copied into this file. Do not delete this metadata to
-retry sign-in: already provisioned state with missing routing fails explicitly
-instead of guessing routing or replacing Apple's state. This also applies when
-another user or application provisioned the machine without this metadata.
-
-The offline `build/gsa-diagnose --record-routing VALUE` recovery operation can
-record a value retained from a successful provisioning response, provided native
-state exists and no routing record is already present. It cannot discover or
-guess a lost routing value and makes no Apple request.
+Apple ADI blobs are not copied into this file. A missing or unusable record invokes
+the bounded native repair above. There is no manual routing-value recovery command.
 
 ### Device resynchronization
 
@@ -217,8 +275,10 @@ number to the returned `midSyncMachine` URL. Both URLs must be HTTPS on exactly
 `gsa.apple.com`, port 443, below `/grandslam/`; redirects are refused.
 
 After an `ec 0` response, any returned routing value is validated and stored under
-the same per-user lock. The failed `init` or `complete` operation is retried once
-with a newly generated OTP. This bound prevents a repeated server challenge from
+the same machine-wide lock. The failed `init` or `complete` operation is retried once
+with a newly generated OTP. If the OTP has not advanced, the adapter waits until
+the next 30-second boundary and checks again, rather than immediately resending
+the same value. This bound prevents a repeated server challenge from
 creating a request loop. The original password, SRP proof, verification code and
 service tokens never cross the helper IPC or enter the synchronization request.
 
@@ -242,35 +302,30 @@ for the preference pane's own requests. If an account helper owns the request, t
 process must also be restarted to load updated code.
 
 Existing provisioned machines are repaired automatically when Apple requests it.
-Do not delete `/Users/Shared/adi` or AquaTransport's Anisette metadata in response
-to `434/-22421`; deleting either can make the existing machine state unrecoverable.
+A `434/-22421` response uses the synchronization flow; no manual deletion is
+necessary. Missing AquaTransport metadata uses the separate bounded provisioning
+repair. Neither path clears account credentials or indiscriminately deletes
+Apple's shared ADI directory.
 
-For trusted-device two-factor authentication, the first attempt requests a code and
-returns an authentication failure to the old client. Approve the request on the
-trusted device, then retry within five minutes using **your password immediately
-followed by the six-digit code**. A code by itself is not supported. Keep the same
-preference pane/helper process running between attempts. If you dismiss or miss the
-code, retry with just your password to request another one, even if your password
-ends in six or more digits. An appended code is recognized only when the input is
-exactly six characters longer than the original password and ends in six ASCII
-digits. Length and slicing both use NSString's UTF-16 code units, so Unicode
-passwords follow the same rule.
+For trusted-device two-factor authentication, approve the prompt, then retry within
+five minutes using **your password immediately followed by the six-digit code**.
+Keep the same preference-pane/helper process running between attempts. The first
+password exchange must verify the server proof before a pending verification
+session is retained. Code validation must return explicit success and a usable
+`X-Apple-PE-Token`; its decoded token completes sign-in without another password
+exchange. A code alone also works unless the original password was itself six
+digits long; in that ambiguous case always append the code to the password.
 
-Length is only a format hint: a different password exactly six characters longer
-and ending in six digits can be mistaken for password-plus-code while verification
-is pending. Apple must validate the code and then the password through SRP before
-sign-in succeeds. If you changed your password into that shape, wait for the pending
-session to expire or restart the preference pane/helper process before retrying.
-
-Pending state stores the verification session, password length, and expiration time.
-No password fingerprint or plaintext password is retained in pending state.
-The state is bounded to 32 accounts per process and expires after five minutes;
-expired records are removed on the next attempt. Expiration limits validity, not
-memory retention: an idle process can retain an expired record until its next
-attempt or process exit. Removing a record does not guarantee its memory is erased.
+Pending state contains the verified session, device identity, original password
+length and expiry. It contains no plaintext password or password fingerprint,
+is bounded to 32 accounts per process, and expires after five minutes. Expired
+entries are removed on the next attempt or process exit; memory erasure is not
+guaranteed. A changed identity requires restarting sign-in. SMS delivery, account
+recovery and terms acceptance are not implemented; an authenticated 409 can retain
+the session for a manually obtained verification code if notification fails.
 
 The old pane may show a generic authentication failure rather than instructions for
-entering the code. The user completed this two-attempt flow with a real account. SMS-only
+entering the code. Earlier builds completed a two-attempt flow with a real account. SMS-only
 verification (`secondaryAuth`), account recovery, account creation, terms acceptance,
 Game Center and full Find My support are not implemented. The experimental iMessage profile
 adapter is described below; native iMessage sign-in is user-confirmed on Mavericks. This module does not
@@ -368,7 +423,12 @@ only `com.apple.madrid`. It supplies the username/PET, device headers and
 `service-data` must contain nonempty `profile-id` and `auth-token` strings. Only then
 are those server-issued credentials translated into the profile response expected
 by Mavericks. Failed or malformed replies never become successful activation.
-There is no fallback request to `authenticateUser`, and no token caching/replay.
+There is no fallback request to `authenticateUser`. One successful IDS delegate
+response is retained for up to 60 seconds to satisfy an identical repeated request
+without reusing a consumed verification code. Matching uses a per-record random
+HMAC key over the request body, URL and client headers. Changed input or expiry
+invalidates the entry. Passwords and codes are not retained in that cache; an idle
+process can retain an expired response until the next lookup or process exit.
 The existing `disable-icloud-gsa` flag also disables this adapter.
 
 The PET-to-delegate exchange is independently implemented with reference to
@@ -564,8 +624,8 @@ oversized/truncated data, cancellation, an unavailable service and rejection of
 an unexpected server identity on both Intel
 architectures and in a GC host.
 
-With no arguments, `build/gsa-diagnose` calls the real native backend but refuses
-to provision and blocks HTTP. `build/anisette-ipc-test --live` exercises the
+With no arguments, `build/gsa-diagnose` checks native provisioning and generates
+local proofs without opening metadata, provisioning, or making HTTP requests. `build/anisette-ipc-test --live` exercises the
 production client and installed helper; only use it after checking native state
 to keep the check offline. Both withhold all device-header values. Mock tests
 alone do not establish usable provisioning or successful Apple sign-in; the live

@@ -1,12 +1,14 @@
 /* Native device authentication. Apple owns the cryptography and ADI storage.
- * Our per-user file contains only the hardware UUID, routing and retry time.
- * Never reset existing ADI state or fetch code/device headers from a server. */
+ * One machine-wide file under the installation directory records hardware UUID,
+ * routing and retry time. Missing routing is repaired by bounded native
+ * reprovisioning of the production (-2) record, never by deleting the ADI store. */
 #include <mach-o/dyld.h>
 #include <mach-o/nlist.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include "aquatransport_anisette_state.h"
 
 static struct {
     int (*otp)(uint64_t, void **, uint32_t *, void **, uint32_t *);
@@ -16,6 +18,7 @@ static struct {
     int (*destroy)(uint32_t);
     int (*dispose)(void *);
     int (*state)(uint64_t);
+    int (*erase)(uint64_t);
 } AQADI;
 
 /* These named AOSKit wrappers have identical ABIs in both Intel slices.
@@ -91,6 +94,8 @@ static BOOL aq_adi_load(void) {
         AQADI.destroy = aq_adi_symbol("_fy34trz2st");
         AQADI.dispose = aq_adi_symbol("_jk24uiwqrg");
         AQADI.state = aq_adi_symbol("_aslgmuibau");
+        /* AOSUtilities' RP action calls this exact uint64_t wrapper. */
+        AQADI.erase = aq_adi_symbol("_p435tmhbla");
     }
     return AQADI.otp && AQADI.start && AQADI.finish && AQADI.destroy && AQADI.dispose && AQADI.state;
 }
@@ -104,17 +109,16 @@ static NSString *aq_adi_routing(id value) {
 }
 
 static int aq_adi_lock(NSError **error) {
-    NSString *directory = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/AquaTransport"];
-    struct stat st;
-    if (mkdir([directory fileSystemRepresentation], 0700) && errno != EEXIST) goto failed;
-    if (lstat([directory fileSystemRepresentation], &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077)) goto failed;
-    NSString *path = [directory stringByAppendingPathComponent:@"anisette.plist"];
-    int fd = open([path fileSystemRepresentation], O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+#ifdef AQ_ANISETTE_WORKER
+    int fd = dup(AQ_ANISETTE_STATE_FD);
     if (fd < 0) goto failed;
-    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1 || (st.st_mode & 077) || st.st_size > 4096) { close(fd); goto failed; }
-    if (flock(fd, LOCK_EX | LOCK_NB)) {
-        close(fd); *error = aq_error(14, @"Local device authentication is in use by another process. Try again shortly."); return -1;
-    }
+    if (!aq_adi_state_valid(fd, 0)) { close(fd); goto failed; }
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+#else
+    /* Diagnostics never manufacture a per-user copy of machine state. */
+    int fd = aq_adi_open_state(AQ_ANISETTE_STATE_DIRECTORY, 0);
+    if (fd < 0) goto failed;
+#endif
     return fd;
 failed:
     *error = aq_error(14, @"Cannot securely open local device authentication metadata."); return -1;
@@ -164,7 +168,7 @@ static NSDictionary *aq_adi_request(AQGSAProtocol *owner, NSString *url, NSDicti
     if ([response statusCode] != 200 || !result) { *error = aq_error(15, @"Apple device provisioning failed."); return nil; }
     return result;
 }
-static NSString *aq_adi_provision(AQGSAProtocol *owner, NSString *device, int fd, NSMutableDictionary *record, NSError **error) {
+static NSString *aq_adi_provision(AQGSAProtocol *owner, NSString *device, int fd, NSMutableDictionary *record, BOOL repair, NSError **error) {
     /* Exactly lookup/start/finish, no retry and no Apple ID or password. */
     NSDictionary *bag = aq_dict([aq_adi_request(owner, @"https://gsa.apple.com/grandslam/GsService2/lookup", nil, device, error) objectForKey:@"urls"]);
     NSString *begin = aq_string([bag objectForKey:@"midStartProvisioning"]), *end = aq_string([bag objectForKey:@"midFinishProvisioning"]);
@@ -172,6 +176,22 @@ static NSString *aq_adi_provision(AQGSAProtocol *owner, NSString *device, int fd
     NSDictionary *reply = aq_dict([aq_adi_request(owner, begin, [NSDictionary dictionary], device, error) objectForKey:@"Response"]);
     NSData *spim = aq_adi_decode([reply objectForKey:@"spim"]);
     if (!spim) { if (!*error) *error = aq_error(15, @"Apple returned invalid provisioning data."); return nil; }
+    if ([owner isStopped]) { *error = aq_error(NSUserCancelledError, @"Device provisioning cancelled."); return nil; }
+    if (repair) {
+        /* Delay reset until Apple has supplied a valid start challenge. Network
+         * failure, bad URLs or malformed challenges leave native state intact. */
+        int state = AQADI.state((uint64_t)-2);
+        if (state == 0) {
+            if (!AQADI.erase || AQADI.erase((uint64_t)-2)) {
+                *error = aq_error(18, @"Native device authentication could not reset its incomplete provisioning record."); return nil;
+            }
+        } else if (state != -45061) {
+            *error = aq_error(12, @"Native device provisioning state is unavailable."); return nil;
+        }
+        if (AQADI.state((uint64_t)-2) != -45061) {
+            *error = aq_error(18, @"Native device authentication did not enter the unprovisioned state."); return nil;
+        }
+    }
     void *cpim = NULL; uint32_t length = 0, session = 0;
     int status = AQADI.start((uint64_t)-2, [spim bytes], (uint32_t)[spim length], &cpim, &length, &session);
     BOOL started = !status, finished = NO; NSString *routing = nil;
@@ -198,12 +218,15 @@ static NSString *aq_adi_provision(AQGSAProtocol *owner, NSString *device, int fd
     return routing;
 }
 
-/* Caller holds the per-user lock and has initialized the native ABI. */
+/* Caller holds the machine-wide lock and has initialized the native ABI. */
 static NSDictionary *aq_adi_headers(AQGSAProtocol *owner, NSString *device, int fd, NSError **error) {
     NSMutableDictionary *record = aq_adi_read(fd);
     NSString *routing = [[record objectForKey:@"device"] isEqual:device] ? aq_adi_routing([record objectForKey:@"routing"]) : nil;
     int state = AQADI.state((uint64_t)-2);
-    if (state == -45061) {
+    if (state && state != -45061) { *error = aq_error(12, @"Native device provisioning state is unavailable."); return nil; }
+    BOOL repair = state == 0 && !routing;
+    if (state == -45061 || repair) {
+        if (repair && !AQADI.erase) { *error = aq_error(18, @"This Apple framework cannot repair incomplete device provisioning."); return nil; }
         id attempt = [record objectForKey:@"lastAttempt"];
         if ([attempt isKindOfClass:[NSDate class]] && [attempt timeIntervalSinceNow] > -86400) {
             *error = aq_error(17, @"Local device provisioning was already attempted. It can be retried after 24 hours."); return nil;
@@ -211,17 +234,19 @@ static NSDictionary *aq_adi_headers(AQGSAProtocol *owner, NSString *device, int 
         [record removeAllObjects]; [record setObject:device forKey:@"device"];
         [record setObject:[NSDate date] forKey:@"lastAttempt"];
         if (!aq_adi_save(fd, record)) { *error = aq_error(14, @"Could not save the device provisioning attempt."); return nil; }
-        routing = aq_adi_provision(owner, device, fd, record, error);
+        if (repair) syslog(LOG_NOTICE, "AquaTransport repairing missing device routing through native provisioning (adapter 18)");
+        routing = aq_adi_provision(owner, device, fd, record, repair, error);
         if (!routing) return nil;
-    } else if (state) { *error = aq_error(12, @"Native device provisioning state is unavailable."); return nil; }
-    if (!routing) { *error = aq_error(18, @"This device is provisioned but its Apple routing record is missing. Existing native state has been preserved."); return nil; }
+        [record removeObjectForKey:@"lastAttempt"];
+        if (!aq_adi_save(fd, record)) { *error = aq_error(14, @"Could not complete local device provisioning metadata."); return nil; }
+    }
     void *machine = NULL, *otp = NULL; uint32_t ml = 0, ol = 0;
     int status = AQADI.otp((uint64_t)-2, &machine, &ml, &otp, &ol);
     @try {
         if (status || !machine || !otp || !ml || !ol || ml > 12288 || ol > 12288) { *error = aq_error(12, @"Native device authentication returned no usable OTP."); return nil; }
         return [NSDictionary dictionaryWithObjectsAndKeys:
             aq_base64([NSData dataWithBytes:machine length:ml]), @"X-Apple-MD-M",
-            aq_base64([NSData dataWithBytes:otp length:ol]), @"X-Apple-MD", routing, @"X-Apple-I-MD-RINFO", nil];
+            aq_base64([NSData dataWithBytes:otp length:ol]), @"X-Apple-MD", routing, @"X-Apple-I-MD-RINFO", device, @"device", nil];
     } @finally { if (machine) AQADI.dispose(machine); if (otp) AQADI.dispose(otp); }
 }
 

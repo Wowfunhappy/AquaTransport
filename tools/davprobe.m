@@ -8,7 +8,7 @@ static NSString *mode;
 static int providerCalls, davCalls, authCalls, unexpected;
 static id localOTP(id self, SEL selector, id owner, NSError **error) {
     providerCalls++;
-    return [mode isEqual:@"missing"] ? @{} : @{@"X-Apple-MD": @"otp", @"X-Apple-MD-M": @"machine", @"X-Apple-I-MD-RINFO": @"12345"};
+    return [mode isEqual:@"missing"] ? @{} : @{@"X-Apple-MD": @"otp", @"X-Apple-MD-M": @"machine", @"X-Apple-I-MD-RINFO": @"12345", @"device": AQTestDevice};
 }
 static NSData *data(NSString *s) { return [s dataUsingEncoding:NSUTF8StringEncoding]; }
 @interface DAVMock : NSURLProtocol <NSURLAuthenticationChallengeSender> @end
