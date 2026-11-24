@@ -13,9 +13,7 @@ echo "Please type in your password and press return. No characters will appear a
 sudo true || exit 1
 
 sudo launchctl unload /usr/share/aquatransport/org.aquatransport.anisette.plist
-
 sudo launchctl unload /usr/share/aquatransport/airdrop/org.aquatransport.airdrop.plist
-sudo launchctl unload /Library/LaunchDaemons/org.aquatransport.bootstrap.plist
 sudo rm -f /Library/LaunchDaemons/org.aquatransport.bootstrap.plist
 
 SECURITY_BIN="/System/Library/Frameworks/Security.framework/Versions/A/Security"
@@ -25,7 +23,6 @@ sudo rm -rf "/usr/share/aquatransport"
 sudo pkgutil --forget Wowfunhappy.AquaTransport
 
 # Tap Kext
-sudo launchctl unload /Library/LaunchDaemons/net.sf.tuntaposx.tap.plist
 sudo rm -f /Library/LaunchDaemons/net.sf.tuntaposx.tap.plist
 sudo rm -rf /Library/Extensions/tap.kext
 sudo pkgutil --forget net.sf.tuntaposx.tap
