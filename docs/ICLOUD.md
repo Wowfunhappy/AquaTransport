@@ -630,3 +630,52 @@ production client and installed helper; only use it after checking native state
 to keep the check offline. Both withhold all device-header values. Mock tests
 alone do not establish usable provisioning or successful Apple sign-in; the live
 results above are recorded separately.
+
+## Safari iCloud sync on Mavericks
+
+The Safari adapter bridges Safari 7's open tabs, bookmarks, Reading List and
+browsing history to their current CloudKit containers. Remote tabs become native
+`CloudTabDevice` objects. Local tabs are taken from Safari's existing filtered
+device dictionary, after its private-browsing checks, and encrypted before upload.
+Bookmarks and Reading List use Safari's bookmark file lock and reload path.
+History changes use Safari's native Global History batch operations.
+
+Refresh is driven by Safari's existing tab-save/show, bookmark save/reload,
+Global History change, legacy sync, key-value-store and account-change callbacks.
+The per-user worker blocks on Darwin notifications. Successful tab cache changes
+are forwarded to Safari's existing `SyncedCloudTabDevicesDidChangeNotification`.
+There is no independent refresh timer or polling schedule.
+
+The worker's job description lives at
+`/usr/share/aquatransport/cloudtabs/org.aquatransport.cloudtabs.plist`.
+Safari and the iCloud preference pane invoke the existing `aquatransport-bootstrap`
+coordinator with `--user-features` in their GUI user session. It registers the
+worker only on Mavericks, with trusted installed code, private credentials and
+keys, and a matching active iCloud Safari account. The existing bootstrap remains
+the sole global AquaTransport launchd entry.
+
+The worker obtains CloudKit service credentials using the existing local
+Anisette/GSA implementation and a modern service-client profile. Enabling Safari
+in iCloud preferences starts authorization in a separate helper; input sheets are
+attached to the existing iCloud pane. Cancellation or failure leaves Safari
+disabled. Disabling and re-enabling Safari performs fresh authorization. CKKS and
+PCS signatures, authenticated encryption, key-wrap checksums, and account
+identities are verified before cloud data reaches Safari.
+Temporary recovery identities and broad wrapping keys are removed after setup;
+only scoped service credentials, Safari service keys, merge state and UI caches remain
+under `~/Library/Application Support/AquaTransport/CloudTabs` (directory mode 0700,
+files 0600). Credentials are refreshed only when a native-triggered sync receives
+an authentication failure.
+
+The worker uses Mavericks' system `/usr/bin/python2.7` with its standard
+library only. Cryptography uses the bundled native OpenSSL bridge; plist
+serialization uses Foundation. HTTP requests use the existing native
+AquaTransport/CFNetwork transport. No Python packages need to be installed.
+Safari must be enabled for the current account in iCloud preferences. Existing
+signed-in installations initialize by disabling and re-enabling Safari; observing
+an already-enabled account does not initialize or migrate it. Adding
+`disable-safari-cloudtabs` to the existing `config/flags.txt` disables this
+adapter. The Safari, bookmark, History, cryptographic, transport, bootstrap and
+notification tests cover both Intel architectures where the corresponding Apple
+framework is available, account isolation, merge conflicts, private storage,
+native model application, encrypted record formats and event delivery.

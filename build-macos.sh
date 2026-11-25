@@ -83,7 +83,7 @@ fi
 # ---- 2. the dylib ----------------------------------------------------------
 echo "==> building aquatransport.dylib (min $MIN)"
 SRCS=("$DIR/src/aquatransport_engine.c" "$DIR/src/mac/aquatransport_hooks_mac.c" "$DIR/src/mac/aquatransport_config.c"
-      "$DIR/src/mac/aquatransport_airdrop.c" "$DIR/src/mac/aquatransport_maps.c" "$DIR/src/mac/aquatransport_rewrite.c" "$DIR/src/mac/aquatransport_trust_mac.c" "$DIR/src/mac/aquatransport_cfhook.c"
+      "$DIR/src/mac/aquatransport_airdrop.c" "$DIR/src/mac/aquatransport_maps.c" "$DIR/src/mac/aquatransport_safari.c" "$DIR/src/mac/aquatransport_rewrite.c" "$DIR/src/mac/aquatransport_trust_mac.c" "$DIR/src/mac/aquatransport_cfhook.c"
       "$DIR/deps/fishhook/fishhook.c")
 OBJDIR="$BUILD/obj"; rm -rf "$OBJDIR"; mkdir -p "$OBJDIR"
 : > "$BUILD/nothing.exp"
@@ -95,6 +95,8 @@ slices=()
 loader_slices=()
 gsa_slices=()
 maps_slices=()
+cloudtabs_native_slices=()
+printf '_AQCloudTabsNativeCall\n_AQCloudTabsNativeFree\n' > "$BUILD/cloudtabs-native.exp"
 for a in "${ARCHS[@]}"; do
   objs=()
   for src in "${SRCS[@]}"; do
@@ -150,6 +152,22 @@ for a in "${ARCHS[@]}"; do
     -framework Foundation -install_name /usr/share/aquatransport/aquatransport_maps.dylib \
     -Wl,-exported_symbols_list,"$BUILD/nothing.exp" -o "$mout"
   maps_slices+=("$mout")
+  "$GSA_CC" -arch "$a" -mmacosx-version-min=10.7 -O2 -fPIC -fvisibility=hidden \
+    -fobjc-gc -Wall -dynamiclib "$DIR/src/mac/cloudtabs/AQSafariTabs.m" \
+    "$OBJDIR/aquatransport_config-$a.o" -framework AppKit \
+    -install_name /usr/share/aquatransport/aquatransport_safari.dylib \
+    -Wl,-exported_symbols_list,"$BUILD/nothing.exp" -o "$OBJDIR/aquatransport_safari-$a.dylib"
+  clang -arch "$a" -mmacosx-version-min=10.7 -O2 -fvisibility=hidden -Wall -Wno-deprecated-declarations \
+    -I"$LS_OUT/include" "$DIR/src/mac/cloudtabs/authorize.m" "$cobj" \
+    "$OBJDIR/aquatransport_config-$a.o" "$LS_OUT/lib/libcrypto.a" \
+    -framework AppKit -framework IOKit -lz -Wl,-exported_symbols_list,"$BUILD/nothing.exp" \
+    -o "$OBJDIR/aquatransport-cloudtabs-authorize-$a"
+  nativeout="$OBJDIR/aquatransport_cloudtabs_native-$a.dylib"
+  clang -arch "$a" -mmacosx-version-min=10.7 -O2 -fvisibility=hidden -Wall -Wno-deprecated-declarations \
+    -I"$LS_OUT/include" -dynamiclib "$DIR/src/mac/cloudtabs/native.m" "$LS_OUT/lib/libcrypto.a" \
+    -framework Foundation -Wl,-exported_symbols_list,"$BUILD/cloudtabs-native.exp" \
+    -install_name /usr/share/aquatransport/cloudtabs/aquatransport_cloudtabs_native.dylib -o "$nativeout"
+  cloudtabs_native_slices+=("$nativeout")
   echo "    $a ok"
 done
 
@@ -178,6 +196,14 @@ lipo -create "${gsa_slices[@]}" -output "$ST/aquatransport_gsa.dylib"
 lipo -create "${maps_slices[@]}" -output "$ST/aquatransport_maps.dylib"
 lipo -create "$OBJDIR/aquatransport-anisette-x86_64" "$OBJDIR/aquatransport-anisette-i386" -output "$ST/aquatransport-anisette"
 cp "$DIR/src/mac/org.aquatransport.anisette.plist" "$ST/"
+lipo -create "$OBJDIR/aquatransport_safari-x86_64.dylib" "$OBJDIR/aquatransport_safari-i386.dylib" -output "$ST/aquatransport_safari.dylib"
+mkdir -p "$ST/cloudtabs"
+lipo -create "${cloudtabs_native_slices[@]}" -output "$ST/cloudtabs/aquatransport_cloudtabs_native.dylib"
+lipo -create "$OBJDIR/aquatransport-cloudtabs-authorize-x86_64" "$OBJDIR/aquatransport-cloudtabs-authorize-i386" -output "$ST/cloudtabs/aquatransport-cloudtabs-authorize"
+cp "$DIR/src/mac/cloudtabs/"*.py "$ST/cloudtabs/"
+cp "$DIR/src/mac/cloudtabs/run.sh" "$ST/cloudtabs/aquatransport-cloudtabs"
+chmod 755 "$ST/cloudtabs/aquatransport-cloudtabs"
+cp "$DIR/src/mac/cloudtabs/org.aquatransport.cloudtabs.plist" "$ST/cloudtabs/"
 
 # AirDrop is a separate Mavericks-only image, loaded after the C eligibility gate.
 bash "$DIR/tools/build-airdrop.sh"
@@ -195,7 +221,7 @@ bash "$DIR/tools/build-airdrop.sh"
 #   Added in 10.7:  strndup strnlen getline getdelim memmem arc4random_buf
 #   Added in 10.12: getentropy clock_gettime clock_gettime_nsec_np
 echo "==> verifying"
-for img in aquatransport.dylib aquatransport_engine.dylib aquatransport_gsa.dylib aquatransport_maps.dylib aquatransport-anisette; do
+for img in aquatransport.dylib aquatransport_engine.dylib aquatransport_gsa.dylib aquatransport_maps.dylib aquatransport_safari.dylib aquatransport-anisette cloudtabs/aquatransport-cloudtabs-authorize; do
 have=$(lipo -info "$ST/$img" | sed 's/.*://')
 echo "    $img architectures:$have"
 POST106='^_(strndup|strnlen|getline|getdelim|memmem|getentropy|clock_gettime|clock_gettime_nsec_np|arc4random_buf|dispatch_activate|os_unfair_lock_lock)$'
@@ -208,6 +234,15 @@ for a in "${ARCHS[@]}"; do
                      echo "$bad" | sed 's/^/      /'; exit 1; }
 done
 done
+for a in "${ARCHS[@]}"; do
+  native="$ST/cloudtabs/aquatransport_cloudtabs_native.dylib"
+  exported=$(nm -arch "$a" -g "$native" | awk '/ (T|D|B|S) _/ {print $NF}' | sort)
+  expected=$(sort "$BUILD/cloudtabs-native.exp")
+  [ "$exported" = "$expected" ] || { echo "FATAL: unexpected native CloudTabs exports ($a)"; exit 1; }
+  bad=$(nm -arch "$a" -u "$native" | tr -d ' ' | grep -E "$POST106" || true)
+  [ -z "$bad" ] || { echo "FATAL: unsupported native CloudTabs import ($a): $bad"; exit 1; }
+done
+echo "    CloudTabs: two native bridge exports; OpenSSL symbols remain private"
 echo "    per slice: present, only the WebKit hook exported, no post-$MIN imports"
 for img in aquatransport_gsa.dylib aquatransport-anisette; do
   for a in "${ARCHS[@]}"; do

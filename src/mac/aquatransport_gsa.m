@@ -472,6 +472,11 @@ static NSDictionary *aq_exchange(AQGSAProtocol *owner, NSMutableDictionary *payl
             [[payload objectForKey:@"o"] isEqual:@"init"] ? "init" : "complete", (long)[r statusCode],
             [hsc isKindOfClass:[NSNumber class]] ? (long)[hsc integerValue] : -1L,
             [ec isKindOfClass:[NSNumber class]] ? (long)[ec integerValue] : -1L);
+#ifdef AQ_GSA_EXCHANGE_FAILURE
+        /* Optional diagnostic for the standalone Safari helper. Not compiled
+         * into the system sign-in adapter; it cannot change the exchange. */
+        AQ_GSA_EXCHANGE_FAILURE(r, replyStatus);
+#endif
         *error = aq_error(20, @"Apple rejected the GrandSlam exchange."); return nil;
     }
     return nil;

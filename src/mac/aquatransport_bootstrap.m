@@ -60,6 +60,8 @@ static BOOL loadJob(const char *path,const char *label) {
     return YES;
 }
 
+#include "aquatransport_cloudtabs_bootstrap.inc"
+
 static void loadAnisetteIfEligible(void) {
     struct utsname os;
     if(uname(&os) || atoi(os.release)<11 || tf_flag("disable-icloud-gsa") ||
@@ -119,8 +121,11 @@ static void hardwareAvailable(xpc_object_t event) {
     finishBootstrapWork();
 }
 
-int main(void) { @autoreleasepool {
-    if(geteuid()!=0) return 1;
+int main(int argc,char **argv) { @autoreleasepool {
+    if(argc==2 && !strcmp(argv[1],"--user-features")) return loadUserFeatures()?0:1;
+    if(argc==3 && !strcmp(argv[1],"--safari-prepare")) return cloudTabsServiceAction(YES,argv[2]);
+    if(argc==2 && !strcmp(argv[1],"--safari-disable")) return cloudTabsServiceAction(NO,NULL);
+    if(argc!=1 || geteuid()!=0) return 1;
     // Resolve at runtime to preserve the universal bootstrap's 10.6 support.
     void (*setHandler)(const char *,dispatch_queue_t,xpc_handler_t)=
         dlsym(RTLD_DEFAULT,"xpc_set_event_stream_handler");

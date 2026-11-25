@@ -44,7 +44,7 @@ if [ -e "$BACKUP" ]; then
 fi
 # Require the complete payload before replacing any library. Package installations
 # can supply it in LIBDIR instead of the build stage.
-for lib in aquatransport_maps.dylib aquatransport_gsa.dylib aquatransport_engine.dylib aquatransport.dylib; do
+for lib in aquatransport_maps.dylib aquatransport_gsa.dylib aquatransport_safari.dylib aquatransport_engine.dylib aquatransport.dylib; do
   [ -f "$SRC/$lib" ] || [ -f "$LIBDIR/$lib" ] ||
     { echo "missing $lib -- run ./build-macos.sh first"; exit 1; }
 done
@@ -56,7 +56,7 @@ done
 # Dependencies go first. Only the loader is named by a load command, so a window in which
 # the loader is present and the engine is not is a window of processes without TLS.
 mkdir -p "$LIBDIR" "$CONFDIR"
-for lib in aquatransport_maps.dylib aquatransport_gsa.dylib aquatransport_engine.dylib aquatransport.dylib; do
+for lib in aquatransport_maps.dylib aquatransport_gsa.dylib aquatransport_safari.dylib aquatransport_engine.dylib aquatransport.dylib; do
   if [ -f "$SRC/$lib" ]; then
     cp "$SRC/$lib" "$LIBDIR/$lib.new"
     chown root:wheel "$LIBDIR/$lib.new"; chmod 0644 "$LIBDIR/$lib.new"
@@ -70,6 +70,19 @@ if [ -f "$SRC/aquatransport-anisette" ]; then
   mv -f "$LIBDIR/aquatransport-anisette.new" "$LIBDIR/aquatransport-anisette"
 fi
 install -o root -g wheel -m 644 "$DIR/src/mac/org.aquatransport.anisette.plist" "$LIBDIR/"
+if [ -f "$SRC/cloudtabs/aquatransport-cloudtabs-authorize" ]; then
+  install -d -o root -g wheel -m 755 "$LIBDIR/cloudtabs"
+  install -o root -g wheel -m 644 "$SRC/cloudtabs/aquatransport_cloudtabs_native.dylib" "$LIBDIR/cloudtabs/aquatransport_cloudtabs_native.dylib.new"
+  mv -f "$LIBDIR/cloudtabs/aquatransport_cloudtabs_native.dylib.new" "$LIBDIR/cloudtabs/aquatransport_cloudtabs_native.dylib"
+  for source in "$SRC/cloudtabs/"*.py; do
+    install -o root -g wheel -m 644 "$source" "$LIBDIR/cloudtabs/"
+  done
+  for executable in aquatransport-cloudtabs aquatransport-cloudtabs-authorize; do
+    install -o root -g wheel -m 755 "$SRC/cloudtabs/$executable" "$LIBDIR/cloudtabs/$executable.new"
+    mv -f "$LIBDIR/cloudtabs/$executable.new" "$LIBDIR/cloudtabs/$executable"
+  done
+  install -o root -g wheel -m 644 "$SRC/cloudtabs/org.aquatransport.cloudtabs.plist" "$LIBDIR/cloudtabs/"
+fi
 # Seed each rule file from the shipped default when it is not already present, so a reinstall
 # keeps a user's edits. flags.txt has no default and starts empty.
 for f in headers.txt redirects.txt disabled.txt; do
@@ -83,7 +96,7 @@ done
 # root:wheel because the library loads into root daemons.
 chown root:wheel "$LIBDIR" "$DYLIB" "$ENGINE"
 chmod 0755 "$LIBDIR"; chmod 0644 "$DYLIB" "$ENGINE"
-for lib in aquatransport_gsa.dylib aquatransport_maps.dylib; do
+for lib in aquatransport_gsa.dylib aquatransport_maps.dylib aquatransport_safari.dylib; do
   if [ -f "$LIBDIR/$lib" ]; then
     chown root:wheel "$LIBDIR/$lib"; chmod 0644 "$LIBDIR/$lib"
   fi
@@ -108,11 +121,27 @@ if [ -f "$SRC/aquatransport_airdrop.dylib" ]; then
     install -d -o root -g wheel -m 755 "$locale_dest"
     install -o root -g wheel -m 644 "$locale/Localizable.strings" "$locale_dest/"
   done
-  install -o root -g wheel -m 755 "$SRC/aquatransport_airdrop.dylib" "$LIBDIR/"
+  install -o root -g wheel -m 644 "$SRC/aquatransport_airdrop.dylib" "$LIBDIR/"
 fi
 if [ -f "$SRC/aquatransport-bootstrap" ]; then
   install -o root -g wheel -m 755 "$SRC/aquatransport-bootstrap" "$LIBDIR/"
   install -o root -g wheel -m 644 "$DIR/build/stage/Library/LaunchDaemons/org.aquatransport.bootstrap.plist" /Library/LaunchDaemons/
 fi
 AQ_SECURITY_PATH="$SEC" AQ_INSERT_DYLIB="$INSERT" bash "$DIR/packaging/postinstall.sh"
+
+# Safari's worker runs in the signed-in user's session. Setup creates its
+# private state under that user's Library directory.
+CLOUD_AGENT="$LIBDIR/cloudtabs/org.aquatransport.cloudtabs.plist"
+if [ -f "$CLOUD_AGENT" ] && [ -x "$LIBDIR/cloudtabs/aquatransport-cloudtabs" ]; then
+    cloud_uid=$(stat -f %u /dev/console)
+    cloud_user=$(stat -f %Su /dev/console)
+    if [ "$cloud_uid" -ge 500 ] && [ "$cloud_user" != loginwindow ]; then
+        cloud_pid=$(pgrep -u "$cloud_uid" -x Finder | head -1)
+        if [ -n "$cloud_pid" ]; then
+            launchctl bsexec "$cloud_pid" sudo -u "$cloud_user" launchctl unload "$CLOUD_AGENT" >/dev/null 2>&1 || true
+            launchctl bsexec "$cloud_pid" sudo -u "$cloud_user" "$LIBDIR/aquatransport-bootstrap" --user-features
+        fi
+    fi
+fi
+
 echo "Installed. Restart your computer."

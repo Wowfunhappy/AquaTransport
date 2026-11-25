@@ -8,6 +8,7 @@
 //   debug                        log handshakes to /tmp/aquatransport-<uid>.log
 //   disable-mtls                 hand client-certificate connections back to the system stack
 //   disable-icloud-gsa            turn off iCloud authentication on 10.7+ (docs/ICLOUD.md)
+//   disable-safari-cloudtabs      keep Safari's native legacy tab store on Mavericks
 //   disable-certificate-pinning  honour system and keychain anchors for anchor-restricted
 //                                evaluations, defeating pinning process-wide (for monitoring
 //                                your own traffic through a locally trusted proxy root)

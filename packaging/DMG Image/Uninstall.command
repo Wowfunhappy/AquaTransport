@@ -12,9 +12,22 @@ fi
 echo "Please type in your password and press return. No characters will appear as you type."
 sudo true || exit 1
 
-sudo launchctl unload /usr/share/aquatransport/org.aquatransport.anisette.plist
-sudo launchctl unload /usr/share/aquatransport/airdrop/org.aquatransport.airdrop.plist
+# We need to unload the current user's cloud tabs job before deleting the Application Support directory,
+# or the job might recreate that directory before we reboot.
+sudo launchctl unload /usr/share/aquatransport/cloudtabs/org.aquatransport.cloudtabs.plist  >/dev/null 2>&1 || true
+dscl . -list /Users UniqueID | while read -r username uid
+do
+    [ "$uid" -ge 500 ] || continue
+    user_home="$(dscl . -read "/Users/$username" NFSHomeDirectory 2>/dev/null | sed 's/^NFSHomeDirectory: //')"
+	case "$user_home" in ""|"/"|"/Users"|"/Library"|"/System"|"/private"|"/var")
+            continue
+            ;;
+    esac
+    sudo rm -rf -- "$user_home/Library/Application Support/AquaTransport"
+done
+
 sudo rm -f /Library/LaunchDaemons/org.aquatransport.bootstrap.plist
+# No need to manually unload jobs; we're deleting their definitions, then rebooting.
 
 SECURITY_BIN="/System/Library/Frameworks/Security.framework/Versions/A/Security"
 sudo mv -f "$SECURITY_BIN.original" "$SECURITY_BIN"
